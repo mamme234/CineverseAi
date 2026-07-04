@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
+const cheerio = require('cheerio');
 const http = require('http');
 const fs = require('fs');
 
@@ -18,11 +19,14 @@ server.listen(PORT, '0.0.0.0', () => {
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const REAL_DEBRID_API_KEY = process.env.REAL_DEBRID_API_KEY;
+const MAX_FILE_SIZE = 2000 * 1024 * 1024;
 
-if (!REAL_DEBRID_API_KEY) {
-  console.error('❌ REAL_DEBRID_API_KEY not set!');
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN not set');
   process.exit(1);
 }
+
+console.log('✅ Bot configuration loaded');
 
 // ==================== TMDB ====================
 class TMDB {
@@ -62,22 +66,6 @@ class RealDebrid {
     this.baseUrl = 'https://api.real-debrid.com/rest/1.0';
   }
 
-  // Search torrents for a movie
-  async searchTorrent(query) {
-    try {
-      const url = `${this.baseUrl}/torrents/search?query=${encodeURIComponent(query)}`;
-      const response = await axios.get(url, {
-        headers: { Authorization: `Bearer ${this.apiKey}` },
-        timeout: 15000
-      });
-      return response.data;
-    } catch (e) {
-      console.error('Real-Debrid search error:', e.message);
-      return [];
-    }
-  }
-
-  // Add a magnet link to Real-Debrid
   async addMagnet(magnet) {
     try {
       const url = `${this.baseUrl}/torrents/addMagnet`;
@@ -98,7 +86,6 @@ class RealDebrid {
     }
   }
 
-  // Get torrent info
   async getTorrentInfo(id) {
     try {
       const url = `${this.baseUrl}/torrents/info/${id}`;
@@ -113,28 +100,6 @@ class RealDebrid {
     }
   }
 
-  // Select files to download
-  async selectFiles(id, fileIds) {
-    try {
-      const url = `${this.baseUrl}/torrents/selectFiles/${id}`;
-      const params = new URLSearchParams();
-      params.append('files', fileIds);
-      
-      const response = await axios.post(url, params, {
-        headers: { 
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        timeout: 10000
-      });
-      return response.data;
-    } catch (e) {
-      console.error('Select files error:', e.message);
-      return null;
-    }
-  }
-
-  // Get unrestricted link
   async unrestrictLink(link) {
     try {
       const url = `${this.baseUrl}/unrestrict/link`;
@@ -163,10 +128,11 @@ class TorrentScraper {
       const url = `https://1337x.to/search/${encodeURIComponent(query)}/1/`;
       const response = await axios.get(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        timeout: 15000
+        timeout: 15000,
+        httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
       });
       
-      const $ = require('cheerio').load(response.data);
+      const $ = cheerio.load(response.data);
       const rows = $('tr');
       const results = [];
       
@@ -211,11 +177,9 @@ bot.start(async (ctx) => {
   ]);
 
   await ctx.replyWithMarkdown(
-    `🎬 *CineverseAI - Real Download Bot*\n\n` +
-    `Click "Search Movie" to find and download any movie!\n\n` +
-    `✅ *Real-Debrid powered*\n` +
-    `✅ Direct download links\n` +
-    `✅ Watch instantly in Telegram`,
+    `🎬 *CineverseAI*\n\n` +
+    `📩 *Just type any movie name and I'll find it!*\n\n` +
+    `Examples: \`Inception\` or \`Vikings Valhalla\``,
     keyboard
   );
 });
@@ -224,10 +188,10 @@ bot.start(async (ctx) => {
 bot.action('search', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.replyWithMarkdown(
-    `🔍 *Send me a movie name*\n\n` +
-    `Example: \`Inception\` or \`Vikings Valhalla\``
+    `🔍 *Type any movie name*\n\n` +
+    `Example: \`Inception\` or \`Vikings Valhalla\`\n\n` +
+    `I will search and send it to you!`
   );
-  ctx.session = { waitingForSearch: true };
 });
 
 // ---------- POPULAR ----------
@@ -255,12 +219,11 @@ bot.action('help', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.replyWithMarkdown(
     `📖 *How to use:*\n\n` +
-    `1️⃣ Click "Search Movie"\n` +
-    `2️⃣ Type the movie name\n` +
-    `3️⃣ Select from results\n` +
-    `4️⃣ Click "Download"\n` +
-    `5️⃣ Bot finds real links via Real-Debrid\n` +
-    `6️⃣ You receive the file!\n\n` +
+    `1️⃣ Type any movie name in chat\n` +
+    `2️⃣ Select from search results\n` +
+    `3️⃣ Click "Download"\n` +
+    `4️⃣ Bot finds real links via Real-Debrid\n` +
+    `5️⃣ You receive the file!\n\n` +
     `📦 Max size: 2GB\n` +
     `⏱️ First download may take 2-5 minutes`,
     Markup.inlineKeyboard([[Markup.button.callback('🔙 Back', 'back')]])
@@ -278,17 +241,17 @@ bot.action('back', async (ctx) => {
   await ctx.replyWithMarkdown(`🎬 *Main Menu*`, keyboard);
 });
 
-// ---------- HANDLE TEXT SEARCH ----------
+// ============================================================
+// ✅ IMPORTANT: THIS HANDLES TEXT MESSAGES - WORKS IMMEDIATELY
+// ============================================================
 bot.on('text', async (ctx) => {
-  if (ctx.message.text.startsWith('/')) return;
-  if (!ctx.session?.waitingForSearch) {
-    await ctx.reply('🔍 Click "Search Movie" first!');
-    return;
-  }
+  const text = ctx.message.text.trim();
   
-  const query = ctx.message.text.trim();
-  ctx.session.waitingForSearch = false;
-  await handleSearch(ctx, query);
+  // Ignore commands
+  if (text.startsWith('/')) return;
+  
+  // Handle movie search directly
+  await handleSearch(ctx, text);
 });
 
 // ---------- SEARCH LOGIC ----------
@@ -296,14 +259,15 @@ async function handleSearch(ctx, query) {
   const status = await ctx.reply(`🔍 Searching for *${query}*...`, { parse_mode: 'Markdown' });
   
   try {
-    // 1. Search TMDB
+    // Search TMDB
     const results = await tmdb.search(query);
+    
     if (!results || results.length === 0) {
-      await ctx.reply(`❌ No results found for "${query}"`);
+      await ctx.reply(`❌ No results found for "${query}"\n\nTry different spelling or add year.`);
       return;
     }
     
-    // 2. Show results as buttons
+    // Show results as buttons
     const buttons = results.slice(0, 5).map(item => {
       const title = item.title || item.name || 'Unknown';
       const year = item.release_date ? item.release_date.split('-')[0] : (item.first_air_date ? item.first_air_date.split('-')[0] : '');
@@ -348,7 +312,7 @@ bot.action(/movie_(\d+)_(movie|tv)/, async (ctx) => {
     if (data.overview) message += `\n\n📝 ${data.overview.substring(0, 300)}...`;
     
     const buttons = [
-      [Markup.button.callback('📥 Download', `download_${id}_${type}_${encodeURIComponent(title)}`)],
+      [Markup.button.callback('📥 Download Now', `download_${id}_${type}_${encodeURIComponent(title)}`)],
       [Markup.button.callback('🔙 Back', 'back')]
     ];
     
@@ -376,18 +340,27 @@ bot.action(/download_(\d+)_(movie|tv)_(.+)/, async (ctx) => {
   const type = ctx.match[2];
   const title = decodeURIComponent(ctx.match[3]);
   
-  await ctx.reply(`🔍 *Searching for:* ${title}...\n⏳ This may take 1-2 minutes`, { parse_mode: 'Markdown' });
+  // Check if Real-Debrid is configured
+  if (!REAL_DEBRID_API_KEY) {
+    await ctx.reply(
+      `❌ Real-Debrid not configured.\n\n` +
+      `Please set REAL_DEBRID_API_KEY in .env file.\n` +
+      `Get one from: https://real-debrid.com/apitoken`
+    );
+    return;
+  }
+  
+  await ctx.reply(`🔍 *Searching torrents for:* ${title}...\n⏳ This may take 1-2 minutes`, { parse_mode: 'Markdown' });
   
   try {
-    // 1. Search torrents on 1337x
+    // Search torrents
     const torrents = await scraper.search1337x(title);
     
     if (!torrents || torrents.length === 0) {
-      await ctx.reply(`❌ No torrents found for "${title}"`);
+      await ctx.reply(`❌ No torrents found for "${title}"\n\nTry a different movie.`);
       return;
     }
     
-    // 2. Try each torrent
     let downloadUrl = null;
     let selectedTorrent = null;
     
@@ -395,19 +368,16 @@ bot.action(/download_(\d+)_(movie|tv)_(.+)/, async (ctx) => {
       await ctx.reply(`🔄 Trying: ${torrent.title.substring(0, 50)}... (${torrent.seeds} seeds)`);
       
       try {
-        // Add magnet to Real-Debrid
         const torrentId = await rd.addMagnet(torrent.magnet);
         if (!torrentId) continue;
         
-        // Wait for torrent to be ready
         let ready = false;
         let attempts = 0;
-        while (!ready && attempts < 15) {
+        while (!ready && attempts < 20) {
           await new Promise(r => setTimeout(r, 3000));
           const info = await rd.getTorrentInfo(torrentId);
           if (info && info.status === 'downloaded' && info.links && info.links.length > 0) {
             ready = true;
-            // Unrestrict the link
             downloadUrl = await rd.unrestrictLink(info.links[0]);
             if (downloadUrl) {
               selectedTorrent = torrent;
@@ -436,7 +406,7 @@ bot.action(/download_(\d+)_(movie|tv)_(.+)/, async (ctx) => {
       return;
     }
     
-    // 3. Download and send file
+    // Download and send file
     await ctx.reply(
       `📥 *Downloading:* ${selectedTorrent.title}\n` +
       `📦 Size: ${selectedTorrent.size}\n` +
@@ -447,7 +417,6 @@ bot.action(/download_(\d+)_(movie|tv)_(.+)/, async (ctx) => {
     
     const filename = `/tmp/${title.replace(/[^a-zA-Z0-9]/g, '_')}.mp4`;
     
-    // Download file
     const response = await axios({
       method: 'get',
       url: downloadUrl,
@@ -465,7 +434,6 @@ bot.action(/download_(\d+)_(movie|tv)_(.+)/, async (ctx) => {
       writer.on('error', reject);
     });
     
-    // Send file
     const stats = fs.statSync(filename);
     const fileSizeMB = (stats.size / 1024 / 1024).toFixed(1);
     
@@ -498,8 +466,12 @@ async function startBot() {
   try {
     const botInfo = await bot.telegram.getMe();
     console.log(`✅ Bot connected: @${botInfo.username}`);
+    console.log(`✅ TMDB: ${TMDB_API_KEY ? '✅' : '❌'}`);
+    console.log(`✅ Real-Debrid: ${REAL_DEBRID_API_KEY ? '✅' : '❌'}`);
+    
     await bot.launch();
     console.log('✅ Bot is running!');
+    console.log(`📡 Bot username: @${botInfo.username}`);
   } catch (e) {
     console.error('❌ Failed to start bot:', e.message);
     process.exit(1);
