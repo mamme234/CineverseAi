@@ -1,7 +1,7 @@
 {
   "name": "cineverse-ai-bot",
   "version": "1.0.0",
-  "description": "Telegram Movie Download Bot - Direct Download",
+  "description": "Telegram Movie Download Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
