@@ -17,7 +17,6 @@ class MovieScraper {
       const response = await this.client.get(searchUrl);
       const $ = cheerio.load(response.data);
 
-      // Find first movie result
       const movieTile = $('.movie-tile').first();
       if (!movieTile.length) return null;
 
@@ -28,7 +27,6 @@ class MovieScraper {
       const detailResponse = await this.client.get(detailUrl);
       const $$ = cheerio.load(detailResponse.data);
 
-      // Extract magnet link
       const magnetTag = $$('a[href^="magnet:?"]').first();
       if (magnetTag.length) {
         return {
@@ -38,7 +36,7 @@ class MovieScraper {
         };
       }
     } catch (error) {
-      console.error('YTS scraper error:', error.message);
+      console.error('YTS error:', error.message);
     }
     return null;
   }
@@ -64,20 +62,16 @@ class MovieScraper {
         };
       }
     } catch (error) {
-      console.error('1337x scraper error:', error.message);
+      console.error('1337x error:', error.message);
     }
     return null;
   }
 
   async getDownloadLink(query) {
-    // Try YTS first
     let result = await this.searchYts(query);
     if (result) return result;
-
-    // Try 1337x as fallback
     result = await this.search1337x(query);
     if (result) return result;
-
     return null;
   }
 }
