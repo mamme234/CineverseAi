@@ -1,7 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const express = require('express');
-const cheerio = require('cheerio');
 
 // ============ CONFIGURATION ============
 const config = {
@@ -187,138 +186,98 @@ async function handlePopular(chatId, msgId) {
     }
 }
 
-// ============ TORRENT SEARCH - MULTIPLE SOURCES ============
+// ============ WORKING TORRENT SEARCH ============
 async function searchTorrents(query) {
-    const allResults = [];
+    const results = [];
     const cleanQuery = encodeURIComponent(query.trim());
     
     console.log(`🔍 Searching: "${query}"`);
 
-    // SOURCE 1: 1337x (with proxy)
+    // METHOD 1: TorrentAPI (Most reliable)
     try {
-        const response = await axios.get(`https://1337x-proxy.com/search/${cleanQuery}/1/`, {
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        const { data } = await axios.get(
+            `https://torrentapi.org/pubapi_v2.php?mode=search&search_string=${cleanQuery}&format=json&limit=10`,
+            { 
+                timeout: 15000,
+                headers: { 'User-Agent': 'Mozilla/5.0' }
             }
-        });
-
-        const $ = cheerio.load(response.data);
-        $('tbody tr').each((i, el) => {
-            if (i >= 3) return false;
-            const name = $(el).find('.name a').last().text().trim();
-            const magnet = $(el).find('.magnet-download a').attr('href');
-            const seeds = $(el).find('.seeds').text().trim();
-            const size = $(el).find('.size').text().trim();
-            
-            if (name && magnet && name.length > 3) {
-                allResults.push({
-                    name: name.substring(0, 60),
-                    magnet: magnet,
-                    seeds: seeds || 'N/A',
-                    size: size || 'N/A',
-                    source: '1337x'
+        );
+        
+        if (data.torrent_results && data.torrent_results.length > 0) {
+            data.torrent_results.slice(0, 5).forEach(t => {
+                results.push({
+                    name: t.title || t.filename || 'Unknown',
+                    magnet: t.download || '',
+                    seeds: t.seeds || 'N/A',
+                    size: t.size || 'N/A',
+                    source: 'TorrentAPI'
                 });
-            }
-        });
-        console.log(`✅ 1337x: ${allResults.length} results`);
+            });
+            console.log(`✅ TorrentAPI: ${results.length} results`);
+        }
     } catch (error) {
-        console.log('❌ 1337x error:', error.message);
+        console.log('❌ TorrentAPI error:', error.message);
     }
 
-    // SOURCE 2: ThePirateBay
-    try {
-        const response = await axios.get(`https://thepiratebay.org/search/${cleanQuery}/0/99/0`, {
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-        });
-
-        const $ = cheerio.load(response.data);
-        $('#searchResult tbody tr').each((i, el) => {
-            if (i >= 3) return false;
-            const name = $(el).find('.detLink').text().trim();
-            const magnet = $(el).find('a[href^="magnet:"]').attr('href');
-            const seeds = $(el).find('td').eq(2).text().trim();
-            const sizeText = $(el).find('.detDesc').text();
-            const size = sizeText.match(/Size ([\d.]+ [A-Z]+)/)?.[1] || 'N/A';
+    // METHOD 2: YTS (Works well for movies)
+    if (results.length < 3) {
+        try {
+            const { data } = await axios.get(
+                `https://yts.mx/api/v2/list_movies.json?query_term=${cleanQuery}&limit=5`,
+                { timeout: 10000 }
+            );
             
-            if (name && magnet && name.length > 3) {
-                allResults.push({
-                    name: name.substring(0, 60),
-                    magnet: magnet,
-                    seeds: seeds || 'N/A',
-                    size: size || 'N/A',
-                    source: 'TPB'
+            if (data.data?.movies) {
+                data.data.movies.forEach(movie => {
+                    movie.torrents?.forEach(t => {
+                        results.push({
+                            name: `${movie.title} (${movie.year}) - ${t.quality} ${t.type}`,
+                            magnet: t.magnet || `https://yts.mx/torrent/download/${t.hash}`,
+                            seeds: t.seeds || 'N/A',
+                            size: t.size || 'N/A',
+                            source: 'YTS'
+                        });
+                    });
                 });
+                console.log(`✅ YTS: ${results.length} results`);
             }
-        });
-        console.log(`✅ TPB: ${allResults.length} results`);
-    } catch (error) {
-        console.log('❌ TPB error:', error.message);
+        } catch (error) {
+            console.log('❌ YTS error:', error.message);
+        }
     }
 
-    // SOURCE 3: YTS API
-    try {
-        const response = await axios.get(`https://yts.mx/api/v2/list_movies.json?query_term=${cleanQuery}&limit=3`, {
-            timeout: 10000
-        });
-
-        if (response.data.data?.movies) {
-            response.data.data.movies.forEach(movie => {
-                movie.torrents?.forEach(t => {
-                    allResults.push({
-                        name: `${movie.title} (${movie.year}) - ${t.quality}`.substring(0, 60),
+    // METHOD 3: SolidTorrents (Alternative API)
+    if (results.length < 3) {
+        try {
+            const { data } = await axios.get(
+                `https://solidtorrents.to/api/v1/search?q=${cleanQuery}&limit=5`,
+                { 
+                    timeout: 15000,
+                    headers: { 'User-Agent': 'Mozilla/5.0' }
+                }
+            );
+            
+            if (data.results) {
+                data.results.forEach(t => {
+                    results.push({
+                        name: t.name || 'Unknown',
                         magnet: t.magnet || '',
                         seeds: t.seeds || 'N/A',
                         size: t.size || 'N/A',
-                        source: 'YTS'
+                        source: 'SolidTorrents'
                     });
                 });
-            });
+                console.log(`✅ SolidTorrents: ${results.length} results`);
+            }
+        } catch (error) {
+            console.log('❌ SolidTorrents error:', error.message);
         }
-        console.log(`✅ YTS: ${allResults.length} results`);
-    } catch (error) {
-        console.log('❌ YTS error:', error.message);
-    }
-
-    // SOURCE 4: TorrentGalaxy (via proxy)
-    try {
-        const response = await axios.get(`https://torrentgalaxy.to/torrents.php?search=${cleanQuery}`, {
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-        });
-
-        const $ = cheerio.load(response.data);
-        $('.tgxtable tbody tr').each((i, el) => {
-            if (i >= 3) return false;
-            const name = $(el).find('.txlight a').text().trim();
-            const magnet = $(el).find('a[href^="magnet:"]').attr('href');
-            const seeds = $(el).find('td').eq(5).text().trim();
-            const size = $(el).find('td').eq(3).text().trim();
-            
-            if (name && magnet && name.length > 3) {
-                allResults.push({
-                    name: name.substring(0, 60),
-                    magnet: magnet,
-                    seeds: seeds || 'N/A',
-                    size: size || 'N/A',
-                    source: 'TorrentGalaxy'
-                });
-            }
-        });
-        console.log(`✅ TorrentGalaxy: ${allResults.length} results`);
-    } catch (error) {
-        console.log('❌ TorrentGalaxy error:', error.message);
     }
 
     // Remove duplicates
     const unique = [];
     const seen = new Set();
-    for (const result of allResults) {
+    for (const result of results) {
         const key = result.name.substring(0, 30);
         if (!seen.has(key)) {
             seen.add(key);
@@ -371,13 +330,13 @@ async function handleTorrent(chatId, data) {
             text += `*${i+1}. ${t.name}*\n`;
             text += `📦 ${t.size} | 👤 ${t.seeds} seeds\n`;
             text += `📡 ${t.source}\n\n`;
-            if (t.magnet) {
+            if (t.magnet && t.magnet.startsWith('magnet:')) {
                 keyboard.push([{ text: `⬇️ Download ${i+1}`, url: t.magnet }]);
             }
         });
 
         if (keyboard.length === 0) {
-            text += '⚠️ No direct download links available.';
+            text += '⚠️ No magnet links available.';
         }
 
         keyboard.push([{ text: '🔍 Search Again', callback_data: 'search_movie' }, { text: '🏠 Menu', callback_data: 'main_menu' }]);
@@ -412,10 +371,9 @@ function showHelp(chatId) {
 /start - Main menu
 
 *Torrent Sources:*
-• 1337x
-• ThePirateBay
+• TorrentAPI
 • YTS
-• TorrentGalaxy`;
+• SolidTorrents`;
 
     bot.sendMessage(chatId, helpText, {
         parse_mode: 'Markdown',
