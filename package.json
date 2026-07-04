@@ -1,7 +1,7 @@
 {
   "name": "cineverse-ai-bot",
   "version": "1.0.0",
-  "description": "CineverseAI - Gemini Powered Movie Download Bot",
+  "description": "CineverseAI - Button-Based Movie Download Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
