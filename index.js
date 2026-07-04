@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const express = require('express');
+const cheerio = require('cheerio');
 
 // ============ CONFIGURATION ============
 const config = {
@@ -9,22 +10,15 @@ const config = {
     port: process.env.PORT || 10000
 };
 
-// ============ VALIDATION ============
-if (!config.telegramToken) {
-    console.error('❌ TELEGRAM_BOT_TOKEN is required');
+if (!config.telegramToken || !config.tmdbApiKey) {
+    console.error('❌ Missing environment variables');
     process.exit(1);
 }
 
-if (!config.tmdbApiKey) {
-    console.error('❌ TMDB_API_KEY is required');
-    process.exit(1);
-}
-
-// ============ INITIALIZE ============
 const bot = new TelegramBot(config.telegramToken, { polling: true });
 const userStates = {};
 
-console.log('✅ Bot started successfully');
+console.log('✅ Bot started');
 
 // ============ MAIN MENU ============
 const mainMenu = {
@@ -38,20 +32,9 @@ const mainMenu = {
     parse_mode: 'Markdown'
 };
 
-const backMenu = (callback) => ({
-    reply_markup: {
-        inline_keyboard: [[{ text: '◀️ Back', callback_data: callback }]]
-    },
-    parse_mode: 'Markdown'
-});
-
 // ============ COMMANDS ============
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, '🎥 *Welcome to CineverseAI Bot!*', mainMenu);
-});
-
-bot.onText(/\/help/, (msg) => {
-    showHelp(msg.chat.id);
 });
 
 // ============ CALLBACKS ============
@@ -62,13 +45,11 @@ bot.on('callback_query', async (query) => {
 
     await bot.answerCallbackQuery(id);
 
-    // Handle torrent callback
     if (data.startsWith('torrent_')) {
         await handleTorrent(chatId, data);
         return;
     }
 
-    // Handle actions
     const actions = {
         'search_movie': () => askSearch(chatId, msgId, 'movie'),
         'search_tv': () => askSearch(chatId, msgId, 'tv'),
@@ -78,9 +59,7 @@ bot.on('callback_query', async (query) => {
         'main_menu': () => bot.editMessageText('🎥 *Welcome to CineverseAI Bot!*', { chat_id: chatId, message_id: msgId, ...mainMenu })
     };
 
-    if (actions[data]) {
-        await actions[data]();
-    }
+    if (actions[data]) await actions[data]();
 });
 
 // ============ SEARCH ============
@@ -90,7 +69,10 @@ async function askSearch(chatId, msgId, type) {
     await bot.editMessageText(`📝 *Enter ${label} name:*`, {
         chat_id: chatId,
         message_id: msgId,
-        ...backMenu('main_menu')
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [[{ text: '◀️ Back', callback_data: 'main_menu' }]]
+        }
     });
 }
 
@@ -205,62 +187,150 @@ async function handlePopular(chatId, msgId) {
     }
 }
 
-// ============ TORRENT SEARCH ============
+// ============ TORRENT SEARCH - MULTIPLE SOURCES ============
 async function searchTorrents(query) {
-    const results = [];
+    const allResults = [];
     const cleanQuery = encodeURIComponent(query.trim());
+    
+    console.log(`🔍 Searching: "${query}"`);
 
-    // Try TorrentAPI
+    // SOURCE 1: 1337x (with proxy)
     try {
-        const { data } = await axios.get(
-            `https://torrentapi.org/pubapi_v2.php?mode=search&search_string=${cleanQuery}&format=json&limit=5`,
-            { timeout: 10000 }
-        );
+        const response = await axios.get(`https://1337x-proxy.com/search/${cleanQuery}/1/`, {
+            timeout: 15000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
 
-        if (data.torrent_results) {
-            data.torrent_results.slice(0, 3).forEach(t => {
-                results.push({
-                    name: t.title || t.filename || 'Unknown',
-                    magnet: t.download || '',
-                    seeds: t.seeds || 'N/A',
-                    size: t.size || 'N/A',
-                    source: 'TorrentAPI'
+        const $ = cheerio.load(response.data);
+        $('tbody tr').each((i, el) => {
+            if (i >= 3) return false;
+            const name = $(el).find('.name a').last().text().trim();
+            const magnet = $(el).find('.magnet-download a').attr('href');
+            const seeds = $(el).find('.seeds').text().trim();
+            const size = $(el).find('.size').text().trim();
+            
+            if (name && magnet && name.length > 3) {
+                allResults.push({
+                    name: name.substring(0, 60),
+                    magnet: magnet,
+                    seeds: seeds || 'N/A',
+                    size: size || 'N/A',
+                    source: '1337x'
+                });
+            }
+        });
+        console.log(`✅ 1337x: ${allResults.length} results`);
+    } catch (error) {
+        console.log('❌ 1337x error:', error.message);
+    }
+
+    // SOURCE 2: ThePirateBay
+    try {
+        const response = await axios.get(`https://thepiratebay.org/search/${cleanQuery}/0/99/0`, {
+            timeout: 15000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
+
+        const $ = cheerio.load(response.data);
+        $('#searchResult tbody tr').each((i, el) => {
+            if (i >= 3) return false;
+            const name = $(el).find('.detLink').text().trim();
+            const magnet = $(el).find('a[href^="magnet:"]').attr('href');
+            const seeds = $(el).find('td').eq(2).text().trim();
+            const sizeText = $(el).find('.detDesc').text();
+            const size = sizeText.match(/Size ([\d.]+ [A-Z]+)/)?.[1] || 'N/A';
+            
+            if (name && magnet && name.length > 3) {
+                allResults.push({
+                    name: name.substring(0, 60),
+                    magnet: magnet,
+                    seeds: seeds || 'N/A',
+                    size: size || 'N/A',
+                    source: 'TPB'
+                });
+            }
+        });
+        console.log(`✅ TPB: ${allResults.length} results`);
+    } catch (error) {
+        console.log('❌ TPB error:', error.message);
+    }
+
+    // SOURCE 3: YTS API
+    try {
+        const response = await axios.get(`https://yts.mx/api/v2/list_movies.json?query_term=${cleanQuery}&limit=3`, {
+            timeout: 10000
+        });
+
+        if (response.data.data?.movies) {
+            response.data.data.movies.forEach(movie => {
+                movie.torrents?.forEach(t => {
+                    allResults.push({
+                        name: `${movie.title} (${movie.year}) - ${t.quality}`.substring(0, 60),
+                        magnet: t.magnet || '',
+                        seeds: t.seeds || 'N/A',
+                        size: t.size || 'N/A',
+                        source: 'YTS'
+                    });
                 });
             });
         }
+        console.log(`✅ YTS: ${allResults.length} results`);
     } catch (error) {
-        console.log('TorrentAPI error:', error.message);
+        console.log('❌ YTS error:', error.message);
     }
 
-    // Try YTS
-    if (results.length < 3) {
-        try {
-            const { data } = await axios.get(
-                `https://yts.mx/api/v2/list_movies.json?query_term=${cleanQuery}&limit=3`,
-                { timeout: 10000 }
-            );
+    // SOURCE 4: TorrentGalaxy (via proxy)
+    try {
+        const response = await axios.get(`https://torrentgalaxy.to/torrents.php?search=${cleanQuery}`, {
+            timeout: 15000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
 
-            if (data.data?.movies) {
-                data.data.movies.forEach(movie => {
-                    movie.torrents?.forEach(t => {
-                        results.push({
-                            name: `${movie.title} (${movie.year}) - ${t.quality}`,
-                            magnet: t.magnet || '',
-                            seeds: t.seeds || 'N/A',
-                            size: t.size || 'N/A',
-                            source: 'YTS'
-                        });
-                    });
+        const $ = cheerio.load(response.data);
+        $('.tgxtable tbody tr').each((i, el) => {
+            if (i >= 3) return false;
+            const name = $(el).find('.txlight a').text().trim();
+            const magnet = $(el).find('a[href^="magnet:"]').attr('href');
+            const seeds = $(el).find('td').eq(5).text().trim();
+            const size = $(el).find('td').eq(3).text().trim();
+            
+            if (name && magnet && name.length > 3) {
+                allResults.push({
+                    name: name.substring(0, 60),
+                    magnet: magnet,
+                    seeds: seeds || 'N/A',
+                    size: size || 'N/A',
+                    source: 'TorrentGalaxy'
                 });
             }
-        } catch (error) {
-            console.log('YTS error:', error.message);
+        });
+        console.log(`✅ TorrentGalaxy: ${allResults.length} results`);
+    } catch (error) {
+        console.log('❌ TorrentGalaxy error:', error.message);
+    }
+
+    // Remove duplicates
+    const unique = [];
+    const seen = new Set();
+    for (const result of allResults) {
+        const key = result.name.substring(0, 30);
+        if (!seen.has(key)) {
+            seen.add(key);
+            unique.push(result);
         }
     }
 
-    return results.slice(0, 5);
+    console.log(`📊 Total unique: ${unique.length}`);
+    return unique.slice(0, 5);
 }
 
+// ============ TORRENT HANDLER ============
 async function handleTorrent(chatId, data) {
     const [, id, type] = data.split('_');
 
@@ -274,14 +344,17 @@ async function handleTorrent(chatId, data) {
         const year = (type === 'movie' ? mediaData.release_date : mediaData.first_air_date)?.split('-')[0] || '';
         const searchQuery = `${title} ${year}`.trim();
 
-        const loading = await bot.sendMessage(chatId, `🔍 *Searching: ${searchQuery}*`, { parse_mode: 'Markdown' });
+        const loading = await bot.sendMessage(chatId, `🔍 *Searching: ${searchQuery}*\n⏳ Please wait...`, { 
+            parse_mode: 'Markdown' 
+        });
 
         const torrents = await searchTorrents(searchQuery);
 
         await bot.deleteMessage(chatId, loading.message_id).catch(() => {});
 
         if (!torrents.length) {
-            return bot.sendMessage(chatId, `❌ No torrents found for "${title}".`, {
+            return bot.sendMessage(chatId, `❌ No torrents found for *"${title}"*.\n\nTry:\n• Different keywords\n• Check spelling\n• Try again later`, {
+                parse_mode: 'Markdown',
                 reply_markup: {
                     inline_keyboard: [
                         [{ text: '🔍 Search Again', callback_data: 'search_movie' }],
@@ -294,7 +367,7 @@ async function handleTorrent(chatId, data) {
         let text = `🎬 *${title}* (${year || 'N/A'})\n\n`;
         const keyboard = [];
 
-        torrents.slice(0, 5).forEach((t, i) => {
+        torrents.forEach((t, i) => {
             text += `*${i+1}. ${t.name}*\n`;
             text += `📦 ${t.size} | 👤 ${t.seeds} seeds\n`;
             text += `📡 ${t.source}\n\n`;
@@ -302,6 +375,10 @@ async function handleTorrent(chatId, data) {
                 keyboard.push([{ text: `⬇️ Download ${i+1}`, url: t.magnet }]);
             }
         });
+
+        if (keyboard.length === 0) {
+            text += '⚠️ No direct download links available.';
+        }
 
         keyboard.push([{ text: '🔍 Search Again', callback_data: 'search_movie' }, { text: '🏠 Menu', callback_data: 'main_menu' }]);
 
@@ -312,7 +389,7 @@ async function handleTorrent(chatId, data) {
 
     } catch (error) {
         console.error('Torrent error:', error.message);
-        await bot.sendMessage(chatId, '❌ Failed to fetch torrents.', {
+        await bot.sendMessage(chatId, '❌ Failed to fetch torrents. Please try again.', {
             reply_markup: {
                 inline_keyboard: [
                     [{ text: '🔍 Try Again', callback_data: 'search_movie' }],
@@ -333,9 +410,12 @@ function showHelp(chatId) {
 
 *Commands:*
 /start - Main menu
-/help - This message
 
-*Sources:* TorrentAPI, YTS, 1337x`;
+*Torrent Sources:*
+• 1337x
+• ThePirateBay
+• YTS
+• TorrentGalaxy`;
 
     bot.sendMessage(chatId, helpText, {
         parse_mode: 'Markdown',
@@ -351,5 +431,4 @@ app.get('/', (req, res) => res.send('CineverseAI Bot is running'));
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 app.listen(config.port, () => console.log(`✅ Health check on port ${config.port}`));
 
-// ============ ERROR HANDLING ============
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err.message));
