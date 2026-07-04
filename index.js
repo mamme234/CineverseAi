@@ -1,16 +1,45 @@
-// index.js
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { torrentProviders } = require('./config');
+const express = require('express');
 
+// ============ ENVIRONMENT VARIABLES ============
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const tmdbApiKey = process.env.TMDB_API_KEY;
-const bot = new TelegramBot(token, { polling: true });
 
-// Main menu with buttons
+// Check if token exists
+if (!token) {
+    console.error('❌ TELEGRAM_BOT_TOKEN is not set in environment variables!');
+    process.exit(1);
+}
+
+if (!tmdbApiKey) {
+    console.error('❌ TMDB_API_KEY is not set in environment variables!');
+    process.exit(1);
+}
+
+// ============ INITIALIZE BOT ============
+let bot;
+try {
+    bot = new TelegramBot(token, { 
+        polling: true,
+        onlyFirstMatch: true
+    });
+    console.log('✅ Bot initialized successfully');
+} catch (error) {
+    console.error('❌ Failed to initialize bot:', error.message);
+    process.exit(1);
+}
+
+// ============ USER STATES ============
+const userStates = {};
+
+// ============ MAIN MENU ============
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    
+    showMainMenu(chatId);
+});
+
+function showMainMenu(chatId) {
     const options = {
         reply_markup: {
             inline_keyboard: [
@@ -20,48 +49,52 @@ bot.onText(/\/start/, (msg) => {
                 ],
                 [
                     { text: '🔥 Trending', callback_data: 'trending' },
-                    { text: '🎯 Popular', callback_data: 'popular' }
+                    { text: '⭐ Popular', callback_data: 'popular' }
                 ],
                 [
                     { text: '❓ Help', callback_data: 'help' }
                 ]
             ]
-        }
+        },
+        parse_mode: 'Markdown'
     };
     
-    bot.sendMessage(chatId, '🎥 *Welcome to CineverseAI Bot!*\n\nChoose an option below:', {
-        ...options,
-        parse_mode: 'Markdown'
-    });
-});
+    bot.sendMessage(chatId, '🎥 *Welcome to CineverseAI Bot!*\n\nChoose an option below:', options);
+}
 
-// Handle button clicks
+// ============ CALLBACK QUERY HANDLER ============
 bot.on('callback_query', async (callbackQuery) => {
     const action = callbackQuery.data;
     const chatId = callbackQuery.message.chat.id;
     const messageId = callbackQuery.message.message_id;
     
-    // Acknowledge the callback
-    await bot.answerCallbackQuery(callbackQuery.id);
+    try {
+        await bot.answerCallbackQuery(callbackQuery.id);
+    } catch (error) {
+        console.error('Error answering callback:', error.message);
+    }
     
     switch(action) {
         case 'search_movie':
         case 'search_tv':
-            await bot.editMessageText(
-                `📝 *Enter the ${action === 'search_movie' ? 'movie' : 'TV show'} name:*`,
-                {
-                    chat_id: chatId,
-                    message_id: messageId,
-                    parse_mode: 'Markdown',
-                    reply_markup: {
-                        inline_keyboard: [
-                            [{ text: '◀️ Back to Main Menu', callback_data: 'main_menu' }]
-                        ]
-                    }
-                }
-            );
-            // Set user state to wait for search input
             userStates[chatId] = { action: 'waiting_for_search', type: action };
+            try {
+                await bot.editMessageText(
+                    `📝 *Enter the ${action === 'search_movie' ? 'movie' : 'TV show'} name:*`,
+                    {
+                        chat_id: chatId,
+                        message_id: messageId,
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: '◀️ Back to Main Menu', callback_data: 'main_menu' }]
+                            ]
+                        }
+                    }
+                );
+            } catch (error) {
+                console.error('Error editing message:', error.message);
+            }
             break;
             
         case 'trending':
@@ -73,23 +106,55 @@ bot.on('callback_query', async (callbackQuery) => {
             break;
             
         case 'main_menu':
-            await showMainMenu(chatId, messageId);
+            try {
+                await bot.editMessageText(
+                    '🎥 *Welcome to CineverseAI Bot!*\n\nChoose an option below:',
+                    {
+                        chat_id: chatId,
+                        message_id: messageId,
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: '🎬 Search Movies', callback_data: 'search_movie' },
+                                    { text: '📺 Search TV Shows', callback_data: 'search_tv' }
+                                ],
+                                [
+                                    { text: '🔥 Trending', callback_data: 'trending' },
+                                    { text: '⭐ Popular', callback_data: 'popular' }
+                                ],
+                                [
+                                    { text: '❓ Help', callback_data: 'help' }
+                                ]
+                            ]
+                        }
+                    }
+                );
+            } catch (error) {
+                console.error('Error returning to main menu:', error.message);
+            }
             break;
             
         case 'help':
             await showHelp(chatId, messageId);
             break;
+            
+        default:
+            if (action && action.startsWith('torrent_')) {
+                await handleTorrentSearch(chatId, action);
+            }
+            break;
     }
 });
 
-// Handle text input for search
-const userStates = {};
+// ============ TEXT MESSAGE HANDLER ============
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
     
-    // Skip commands and callback queries
-    if (text.startsWith('/') || !userStates[chatId]) return;
+    // Skip commands and empty messages
+    if (!text || text.startsWith('/')) return;
+    if (!userStates[chatId]) return;
     
     const state = userStates[chatId];
     if (state.action === 'waiting_for_search') {
@@ -98,10 +163,9 @@ bot.on('message', async (msg) => {
     }
 });
 
-// Search function with buttons for results
+// ============ SEARCH FUNCTIONS ============
 async function performSearch(chatId, query, type) {
     try {
-        // Search TMDb
         const searchType = type === 'search_movie' ? 'movie' : 'tv';
         const response = await axios.get(
             `https://api.themoviedb.org/3/search/${searchType}`,
@@ -114,7 +178,7 @@ async function performSearch(chatId, query, type) {
             }
         );
         
-        if (response.data.results.length === 0) {
+        if (!response.data.results || response.data.results.length === 0) {
             await bot.sendMessage(chatId, '❌ No results found. Try another search.');
             return;
         }
@@ -126,7 +190,7 @@ async function performSearch(chatId, query, type) {
             const year = type === 'search_movie' ? 
                 item.release_date?.split('-')[0] : 
                 item.first_air_date?.split('-')[0];
-            const overview = item.overview?.slice(0, 200) + '...';
+            const overview = item.overview ? item.overview.slice(0, 200) + '...' : 'No description available.';
             
             const buttons = {
                 reply_markup: {
@@ -140,112 +204,160 @@ async function performSearch(chatId, query, type) {
                             { text: '🏠 Main Menu', callback_data: 'main_menu' }
                         ]
                     ]
-                }
+                },
+                parse_mode: 'Markdown'
             };
             
-            const caption = `🎥 *${title}* (${year || 'N/A'})\n\n📝 ${overview || 'No description available.'}`;
+            const caption = `🎥 *${title}* (${year || 'N/A'})\n\n📝 ${overview}`;
             
-            // Send with poster if available
-            if (item.poster_path) {
-                const posterUrl = `https://image.tmdb.org/t/p/w500${item.poster_path}`;
-                await bot.sendPhoto(chatId, posterUrl, {
-                    caption: caption,
-                    parse_mode: 'Markdown',
-                    ...buttons
-                });
-            } else {
-                await bot.sendMessage(chatId, caption, {
-                    parse_mode: 'Markdown',
-                    ...buttons
-                });
+            try {
+                if (item.poster_path) {
+                    const posterUrl = `https://image.tmdb.org/t/p/w500${item.poster_path}`;
+                    await bot.sendPhoto(chatId, posterUrl, {
+                        caption: caption,
+                        ...buttons
+                    });
+                } else {
+                    await bot.sendMessage(chatId, caption, buttons);
+                }
+            } catch (error) {
+                console.error('Error sending result:', error.message);
+                await bot.sendMessage(chatId, caption, buttons);
             }
         }
         
     } catch (error) {
-        console.error('Search error:', error);
+        console.error('Search error:', error.message);
         await bot.sendMessage(chatId, '❌ Error performing search. Please try again.');
     }
 }
 
-// Get torrents with buttons
-bot.on('callback_query', async (callbackQuery) => {
-    const data = callbackQuery.data;
-    const chatId = callbackQuery.message.chat.id;
-    
-    if (data.startsWith('torrent_')) {
-        await bot.answerCallbackQuery(callbackQuery.id);
-        const [, id, type] = data.split('_');
-        
-        await bot.sendMessage(chatId, '🔍 *Searching for torrents...*', {
-            parse_mode: 'Markdown'
+// ============ TRENDING & POPULAR ============
+async function handleTrending(chatId, messageId) {
+    try {
+        const response = await axios.get('https://api.themoviedb.org/3/trending/movie/week', {
+            params: { api_key: tmdbApiKey }
         });
         
-        // Search for torrents
-        const torrents = await searchTorrents(id, type);
+        const movies = response.data.results.slice(0, 5);
+        let text = '🔥 *Trending Movies This Week*\n\n';
         
-        if (torrents.length === 0) {
-            await bot.sendMessage(chatId, '❌ No torrents found. Try another source.');
-            return;
-        }
+        movies.forEach((movie, index) => {
+            const year = movie.release_date?.split('-')[0] || 'N/A';
+            text += `${index + 1}. *${movie.title}* (${year})\n`;
+            if (movie.overview) {
+                text += `   ${movie.overview.slice(0, 80)}...\n\n`;
+            }
+        });
         
-        // Display torrents with download buttons
-        for (const torrent of torrents.slice(0, 3)) {
-            const buttons = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '⬇️ Download Magnet', url: torrent.magnet || '' },
-                            { text: '🔗 Torrent File', url: torrent.url || '' }
-                        ],
-                        [
-                            { text: '🔍 More Results', callback_data: `more_torrents_${id}_${type}` }
-                        ]
-                    ]
-                }
-            };
-            
-            const info = `🧲 *${torrent.name}*\n📦 Size: ${torrent.size || 'N/A'}\n👤 Seeds: ${torrent.seeds || 'N/A'}`;
-            await bot.sendMessage(chatId, info, {
-                parse_mode: 'Markdown',
-                ...buttons
-            });
-        }
-    }
-});
-
-// Helper functions
-async function showMainMenu(chatId, messageId) {
-    const options = {
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: '🎬 Search Movies', callback_data: 'search_movie' },
-                    { text: '📺 Search TV Shows', callback_data: 'search_tv' }
-                ],
-                [
-                    { text: '🔥 Trending', callback_data: 'trending' },
-                    { text: '🎯 Popular', callback_data: 'popular' }
-                ],
-                [
-                    { text: '❓ Help', callback_data: 'help' }
-                ]
-            ]
-        }
-    };
-    
-    await bot.editMessageText(
-        '🎥 *Welcome to CineverseAI Bot!*\n\nChoose an option below:',
-        {
+        await bot.editMessageText(text, {
             chat_id: chatId,
             message_id: messageId,
             parse_mode: 'Markdown',
-            ...options
-        }
-    );
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔍 Search a Movie', callback_data: 'search_movie' }],
+                    [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
+                ]
+            }
+        });
+    } catch (error) {
+        console.error('Trending error:', error.message);
+        await bot.sendMessage(chatId, '❌ Error fetching trending movies.');
+    }
 }
 
-// Health check endpoint
-const express = require('express');
+async function handlePopular(chatId, messageId) {
+    try {
+        const response = await axios.get('https://api.themoviedb.org/3/movie/popular', {
+            params: { api_key: tmdbApiKey }
+        });
+        
+        const movies = response.data.results.slice(0, 5);
+        let text = '⭐ *Popular Movies*\n\n';
+        
+        movies.forEach((movie, index) => {
+            const year = movie.release_date?.split('-')[0] || 'N/A';
+            text += `${index + 1}. *${movie.title}* (${year})\n`;
+            if (movie.overview) {
+                text += `   ${movie.overview.slice(0, 80)}...\n\n`;
+            }
+        });
+        
+        await bot.editMessageText(text, {
+            chat_id: chatId,
+            message_id: messageId,
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔍 Search a Movie', callback_data: 'search_movie' }],
+                    [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
+                ]
+            }
+        });
+    } catch (error) {
+        console.error('Popular error:', error.message);
+        await bot.sendMessage(chatId, '❌ Error fetching popular movies.');
+    }
+}
+
+// ============ HELP ============
+async function showHelp(chatId, messageId) {
+    const helpText = `🤖 *CineverseAI Bot Help*
+
+*What I can do:*
+🎬 *Search Movies* - Find any movie by name
+📺 *Search TV Shows* - Find TV series by name
+🔥 *Trending* - See what's trending this week
+⭐ *Popular* - See most popular movies
+
+*How to use:*
+1. Use the buttons to navigate
+2. Type the movie/TV show name when asked
+3. Click on torrent buttons to get download links
+
+*Commands:*
+/start - Show main menu
+/help - Show this help message
+
+*Note:* You need to have a torrent client to download movies.`;
+
+    await bot.editMessageText(helpText, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
+            ]
+        }
+    });
+}
+
+// ============ TORRENT HANDLER ============
+async function handleTorrentSearch(chatId, data) {
+    const [, id, type] = data.split('_');
+    
+    await bot.sendMessage(chatId, '🔍 *Searching for torrents...*\n\n⚠️ Torrent search feature is being developed.', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
+            ]
+        }
+    });
+}
+
+// ============ ERROR HANDLING ============
+bot.on('error', (error) => {
+    console.error('Bot error:', error.message);
+});
+
+bot.on('polling_error', (error) => {
+    console.error('Polling error:', error.message);
+});
+
+// ============ HEALTH CHECK SERVER ============
 const app = express();
 const port = process.env.PORT || 10000;
 
@@ -253,13 +365,26 @@ app.get('/', (req, res) => {
     res.send('CineverseAI Bot is running!');
 });
 
-app.listen(port, () => {
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.listen(port, '0.0.0.0', () => {
     console.log(`✅ Health check server listening on port ${port}`);
 });
 
-// Keep the process alive
+// ============ STARTUP MESSAGE ============
+console.log('🤖 CineverseAI Bot started successfully!');
+console.log(`📌 Bot token: ${token ? '✅ Set (length: ' + token.length + ')' : '❌ Missing'}`);
+console.log(`📌 TMDb API Key: ${tmdbApiKey ? '✅ Set' : '❌ Missing'}`);
+console.log(`📌 Health check: http://localhost:${port}/health`);
+
+// ============ PROCESS HANDLING ============
 process.on('unhandledRejection', (err) => {
     console.error('Unhandled rejection:', err);
 });
 
-console.log('🤖 CineverseAI Bot started successfully!');
+process.on('SIGINT', () => {
+    console.log('🛑 Stopping bot...');
+    process.exit(0);
+});
