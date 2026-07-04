@@ -2,8 +2,25 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { message } = require('telegraf/filters');
 const axios = require('axios');
+const http = require('http');
 const { MovieScraper } = require('./scraper');
 const { connectDB, addMovie, searchMovie } = require('./database');
+
+// ==================== DUMMY HTTP SERVER FOR RENDER ====================
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Health check server listening on port ${PORT}`);
+});
 
 // ==================== CONFIG ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
