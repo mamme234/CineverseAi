@@ -1,8 +1,6 @@
 {
-  "name": "cineverse-ai-bot",
+  "name": "cineverse-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for movies and torrents",
-  "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
@@ -10,8 +8,5 @@
     "axios": "^1.6.7",
     "express": "^4.18.2",
     "node-telegram-bot-api": "^0.64.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
