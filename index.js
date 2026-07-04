@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const express = require('express');
+const cheerio = require('cheerio');
 
 // ============ ENVIRONMENT VARIABLES ============
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -32,6 +33,80 @@ try {
 
 // ============ USER STATES ============
 const userStates = {};
+
+// ============ TORRENT SOURCES ============
+const torrentSources = [
+    {
+        name: '1337x',
+        baseUrl: 'https://1337x.to',
+        searchUrl: (query) => `https://1337x.to/search/${encodeURIComponent(query)}/1/`,
+        parse: (html) => {
+            const $ = cheerio.load(html);
+            const results = [];
+            $('tbody tr').each((i, el) => {
+                if (i >= 5) return false;
+                const name = $(el).find('.name a').last().text().trim();
+                const magnet = $(el).find('.magnet-download a').attr('href');
+                const seeds = $(el).find('.seeds').text().trim();
+                const size = $(el).find('.size').text().trim();
+                if (name && magnet) {
+                    results.push({ name, magnet, seeds, size, source: '1337x' });
+                }
+            });
+            return results;
+        }
+    },
+    {
+        name: 'ThePirateBay',
+        baseUrl: 'https://thepiratebay.org',
+        searchUrl: (query) => `https://thepiratebay.org/search/${encodeURIComponent(query)}/0/99/0`,
+        parse: (html) => {
+            const $ = cheerio.load(html);
+            const results = [];
+            $('#searchResult tbody tr').each((i, el) => {
+                if (i >= 5) return false;
+                const name = $(el).find('.detLink').text().trim();
+                const magnet = $(el).find('a[href^="magnet:"]').attr('href');
+                const seeds = $(el).find('td').eq(2).text().trim();
+                const size = $(el).find('.detDesc').text().match(/Size ([\d.]+ [A-Z]+)/)?.[1] || 'N/A';
+                if (name && magnet) {
+                    results.push({ name, magnet, seeds, size, source: 'TPB' });
+                }
+            });
+            return results;
+        }
+    },
+    {
+        name: 'YTS',
+        baseUrl: 'https://yts.mx',
+        searchUrl: (query) => `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(query)}&limit=5`,
+        parse: async (response) => {
+            try {
+                const data = response.data;
+                const results = [];
+                if (data.data && data.data.movies) {
+                    for (const movie of data.data.movies) {
+                        if (movie.torrents) {
+                            for (const torrent of movie.torrents) {
+                                results.push({
+                                    name: `${movie.title} (${movie.year}) - ${torrent.quality} ${torrent.type}`,
+                                    magnet: torrent.magnet || `https://yts.mx/torrent/download/${torrent.hash}`,
+                                    seeds: torrent.seeds || 'N/A',
+                                    size: torrent.size || 'N/A',
+                                    source: 'YTS'
+                                });
+                            }
+                        }
+                    }
+                }
+                return results.slice(0, 5);
+            } catch (error) {
+                console.error('YTS parse error:', error.message);
+                return [];
+            }
+        }
+    }
+];
 
 // ============ MAIN MENU ============
 bot.onText(/\/start/, (msg) => {
@@ -72,6 +147,18 @@ bot.on('callback_query', async (callbackQuery) => {
         await bot.answerCallbackQuery(callbackQuery.id);
     } catch (error) {
         console.error('Error answering callback:', error.message);
+    }
+    
+    // Handle torrent callback
+    if (action && action.startsWith('torrent_')) {
+        await handleTorrentSearch(chatId, action);
+        return;
+    }
+    
+    // Handle more torrents
+    if (action && action.startsWith('more_torrents_')) {
+        await handleMoreTorrents(chatId, action);
+        return;
     }
     
     switch(action) {
@@ -138,12 +225,6 @@ bot.on('callback_query', async (callbackQuery) => {
         case 'help':
             await showHelp(chatId, messageId);
             break;
-            
-        default:
-            if (action && action.startsWith('torrent_')) {
-                await handleTorrentSearch(chatId, action);
-            }
-            break;
     }
 });
 
@@ -152,7 +233,6 @@ bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
     
-    // Skip commands and empty messages
     if (!text || text.startsWith('/')) return;
     if (!userStates[chatId]) return;
     
@@ -196,8 +276,7 @@ async function performSearch(chatId, query, type) {
                 reply_markup: {
                     inline_keyboard: [
                         [
-                            { text: '🎬 Get Torrents', callback_data: `torrent_${item.id}_${type}` },
-                            { text: '📋 Details', callback_data: `details_${item.id}_${type}` }
+                            { text: '🎬 Get Torrents', callback_data: `torrent_${item.id}_${type}` }
                         ],
                         [
                             { text: '🔍 Search Again', callback_data: type === 'movie' ? 'search_movie' : 'search_tv' },
@@ -232,6 +311,143 @@ async function performSearch(chatId, query, type) {
     }
 }
 
+// ============ TORRENT SEARCH ============
+async function searchTorrents(query) {
+    const allResults = [];
+    
+    for (const source of torrentSources) {
+        try {
+            console.log(`🔍 Searching ${source.name} for: ${query}`);
+            
+            if (source.name === 'YTS') {
+                // YTS uses JSON API
+                const response = await axios.get(source.searchUrl(query), {
+                    timeout: 10000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                });
+                const results = await source.parse(response);
+                allResults.push(...results);
+            } else {
+                // HTML scrapers
+                const response = await axios.get(source.searchUrl(query), {
+                    timeout: 10000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                });
+                const results = source.parse(response.data);
+                allResults.push(...results);
+            }
+            
+            if (allResults.length >= 5) break;
+            
+        } catch (error) {
+            console.error(`❌ ${source.name} error:`, error.message);
+        }
+    }
+    
+    return allResults;
+}
+
+// ============ TORRENT HANDLER ============
+async function handleTorrentSearch(chatId, data) {
+    const [, id, type] = data.split('_');
+    
+    // Get movie/TV show title from TMDb
+    try {
+        const searchType = type === 'movie' ? 'movie' : 'tv';
+        const response = await axios.get(
+            `https://api.themoviedb.org/3/${searchType}/${id}`,
+            {
+                params: {
+                    api_key: tmdbApiKey,
+                    language: 'en-US'
+                }
+            }
+        );
+        
+        const title = type === 'movie' ? response.data.title : response.data.name;
+        const year = type === 'movie' ? 
+            response.data.release_date?.split('-')[0] : 
+            response.data.first_air_date?.split('-')[0];
+        
+        const searchQuery = `${title} ${year || ''}`.trim();
+        
+        // Send searching message
+        const searchingMsg = await bot.sendMessage(
+            chatId, 
+            `🔍 *Searching for torrents:* ${searchQuery}\n\n⏳ Please wait...`,
+            { parse_mode: 'Markdown' }
+        );
+        
+        // Search for torrents
+        const torrents = await searchTorrents(searchQuery);
+        
+        // Delete searching message
+        await bot.deleteMessage(chatId, searchingMsg.message_id);
+        
+        if (torrents.length === 0) {
+            await bot.sendMessage(
+                chatId, 
+                '❌ No torrents found for this title. Try searching with different keywords.',
+                {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '🔍 Try Different Search', callback_data: 'search_movie' }],
+                            [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
+                        ]
+                    }
+                }
+            );
+            return;
+        }
+        
+        // Display torrents
+        const limitedTorrents = torrents.slice(0, 5);
+        let torrentText = `🎬 *Torrents for:* ${title} (${year || 'N/A'})\n\n`;
+        
+        for (let i = 0; i < limitedTorrents.length; i++) {
+            const t = limitedTorrents[i];
+            torrentText += `*${i + 1}. ${t.name}*\n`;
+            torrentText += `📦 Size: ${t.size || 'N/A'} | 👤 Seeds: ${t.seeds || 'N/A'}\n`;
+            torrentText += `📡 Source: ${t.source || 'Unknown'}\n\n`;
+        }
+        
+        const buttons = {
+            reply_markup: {
+                inline_keyboard: [
+                    ...limitedTorrents.map((t, index) => [
+                        { text: `⬇️ Magnet ${index + 1}`, url: t.magnet || '#' }
+                    ]),
+                    [
+                        { text: '🔍 Search Again', callback_data: 'search_movie' },
+                        { text: '🏠 Main Menu', callback_data: 'main_menu' }
+                    ]
+                ]
+            },
+            parse_mode: 'Markdown'
+        };
+        
+        await bot.sendMessage(chatId, torrentText, buttons);
+        
+    } catch (error) {
+        console.error('Torrent search error:', error.message);
+        await bot.sendMessage(
+            chatId, 
+            '❌ Error searching for torrents. Please try again.',
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
+                    ]
+                }
+            }
+        );
+    }
+}
+
 // ============ TRENDING & POPULAR ============
 async function handleTrending(chatId, messageId) {
     try {
@@ -242,24 +458,32 @@ async function handleTrending(chatId, messageId) {
         const movies = response.data.results.slice(0, 5);
         let text = '🔥 *Trending Movies This Week*\n\n';
         
+        const buttons = {
+            reply_markup: {
+                inline_keyboard: []
+            },
+            parse_mode: 'Markdown'
+        };
+        
         movies.forEach((movie, index) => {
             const year = movie.release_date?.split('-')[0] || 'N/A';
             text += `${index + 1}. *${movie.title}* (${year})\n`;
-            if (movie.overview) {
-                text += `   ${movie.overview.slice(0, 80)}...\n\n`;
-            }
+            text += `   ${movie.overview?.slice(0, 80) || 'No description'}\n\n`;
+            
+            buttons.reply_markup.inline_keyboard.push([
+                { text: `🎬 Get ${movie.title}`, callback_data: `torrent_${movie.id}_movie` }
+            ]);
         });
+        
+        buttons.reply_markup.inline_keyboard.push([
+            { text: '🔍 Search a Movie', callback_data: 'search_movie' },
+            { text: '🏠 Main Menu', callback_data: 'main_menu' }
+        ]);
         
         await bot.editMessageText(text, {
             chat_id: chatId,
             message_id: messageId,
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '🔍 Search a Movie', callback_data: 'search_movie' }],
-                    [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
-                ]
-            }
+            ...buttons
         });
     } catch (error) {
         console.error('Trending error:', error.message);
@@ -276,24 +500,32 @@ async function handlePopular(chatId, messageId) {
         const movies = response.data.results.slice(0, 5);
         let text = '⭐ *Popular Movies*\n\n';
         
+        const buttons = {
+            reply_markup: {
+                inline_keyboard: []
+            },
+            parse_mode: 'Markdown'
+        };
+        
         movies.forEach((movie, index) => {
             const year = movie.release_date?.split('-')[0] || 'N/A';
             text += `${index + 1}. *${movie.title}* (${year})\n`;
-            if (movie.overview) {
-                text += `   ${movie.overview.slice(0, 80)}...\n\n`;
-            }
+            text += `   ${movie.overview?.slice(0, 80) || 'No description'}\n\n`;
+            
+            buttons.reply_markup.inline_keyboard.push([
+                { text: `🎬 Get ${movie.title}`, callback_data: `torrent_${movie.id}_movie` }
+            ]);
         });
+        
+        buttons.reply_markup.inline_keyboard.push([
+            { text: '🔍 Search a Movie', callback_data: 'search_movie' },
+            { text: '🏠 Main Menu', callback_data: 'main_menu' }
+        ]);
         
         await bot.editMessageText(text, {
             chat_id: chatId,
             message_id: messageId,
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '🔍 Search a Movie', callback_data: 'search_movie' }],
-                    [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
-                ]
-            }
+            ...buttons
         });
     } catch (error) {
         console.error('Popular error:', error.message);
@@ -311,34 +543,25 @@ async function showHelp(chatId, messageId) {
 🔥 *Trending* - See what's trending this week
 ⭐ *Popular* - See most popular movies
 
+*Torrent Sources:*
+• 1337x
+• ThePirateBay  
+• YTS
+
 *How to use:*
 1. Use the buttons to navigate
 2. Type the movie/TV show name when asked
-3. Click on torrent buttons to get download links
+3. Click on magnet links to download torrents
 
 *Commands:*
 /start - Show main menu
 /help - Show this help message
 
-*Note:* You need to have a torrent client to download movies.`;
+*Note:* You need a torrent client (like qBittorrent) to download movies.`;
 
     await bot.editMessageText(helpText, {
         chat_id: chatId,
         message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
-            ]
-        }
-    });
-}
-
-// ============ TORRENT HANDLER ============
-async function handleTorrentSearch(chatId, data) {
-    const [, id, type] = data.split('_');
-    
-    await bot.sendMessage(chatId, '🔍 *Searching for torrents...*\n\n⚠️ Torrent search feature is being developed.', {
         parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
@@ -366,7 +589,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.status(200).json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        bot: 'running'
+    });
 });
 
 app.listen(port, '0.0.0.0', () => {
@@ -377,7 +604,7 @@ app.listen(port, '0.0.0.0', () => {
 console.log('🤖 CineverseAI Bot started successfully!');
 console.log(`📌 Bot token: ${token ? '✅ Set (length: ' + token.length + ')' : '❌ Missing'}`);
 console.log(`📌 TMDb API Key: ${tmdbApiKey ? '✅ Set' : '❌ Missing'}`);
-console.log(`📌 Health check: http://localhost:${port}/health`);
+console.log(`📌 Torrent Sources: 1337x, ThePirateBay, YTS`);
 
 // ============ PROCESS HANDLING ============
 process.on('unhandledRejection', (err) => {
