@@ -1,0 +1,31 @@
+// config.js
+module.exports = {
+    torrentProviders: [
+        {
+            name: '1337x',
+            domains: [
+                '1337x.to',
+                'x1337x.ws', 
+                '1337x.gd',
+                '1337x.st',
+                '1337xx.to',
+                '1337x.is'
+            ],
+            searchPath: '/search/%s/1/'
+        },
+        {
+            name: 'ThePirateBay',
+            domains: [
+                'thepiratebay.org',
+                'thepiratebay10.org',
+                'piratebayproxy.info'
+            ],
+            searchPath: '/search/%s/0/7/0'
+        },
+        {
+            name: 'YTS',
+            domains: ['yts.mx'],
+            searchPath: '/api/v2/list_movies.json?query_term=%s'
+        }
+    ]
+};
