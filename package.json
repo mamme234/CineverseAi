@@ -1,7 +1,7 @@
 {
   "name": "cineverse-ai-bot",
   "version": "1.0.0",
-  "description": "Telegram Direct Movie Download Bot with Gemini AI",
+  "description": "CineverseAI - Gemini Powered Movie Download Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
