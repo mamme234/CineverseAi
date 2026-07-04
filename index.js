@@ -4,7 +4,6 @@ const { message } = require('telegraf/filters');
 const { Pool } = require('pg');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const tmdbv3 = require('tmdbv3');
 
 // ==================== CONFIG ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -65,8 +64,12 @@ async function searchMovie(query) {
   return result.rows;
 }
 
-// ==================== TMDB ====================
+// ==================== TMDB (Direct API Call) ====================
 async function searchTMDB(query) {
+  if (!TMDB_API_KEY) {
+    console.warn('⚠️ TMDB_API_KEY not set. Skipping TMDb search.');
+    return [];
+  }
   try {
     const url = `https://api.themoviedb.org/3/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(query)}`;
     const response = await axios.get(url);
