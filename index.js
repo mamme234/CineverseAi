@@ -1,29 +1,171 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const { message } = require('telegraf/filters');
-const { initDatabase, searchMovie, addMovie } = require('./database');
-const { MovieScraper } = require('./scraper');
+const { Pool } = require('pg');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const tmdbv3 = require('tmdbv3');
 
-// Config
+// ==================== CONFIG ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = process.env.ADMIN_IDS?.split(',').map(id => parseInt(id.trim())) || [];
 const STORAGE_CHANNEL_ID = parseInt(process.env.STORAGE_CHANNEL_ID);
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
-// Initialize
+// ==================== DATABASE ====================
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDatabase() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS movies (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        year INTEGER,
+        tmdb_id INTEGER UNIQUE,
+        file_id TEXT NOT NULL,
+        quality TEXT DEFAULT '720p',
+        file_size INTEGER,
+        added_by INTEGER,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_movies_title ON movies(title);
+      CREATE INDEX IF NOT EXISTS idx_movies_tmdb ON movies(tmdb_id);
+    `);
+    console.log('✅ Database initialized');
+  } finally {
+    client.release();
+  }
+}
+
+async function addMovie(title, year, tmdbId, fileId, quality, fileSize, addedBy) {
+  const query = `
+    INSERT INTO movies (title, year, tmdb_id, file_id, quality, file_size, added_by)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (tmdb_id) DO UPDATE SET file_id = EXCLUDED.file_id
+    RETURNING id
+  `;
+  const result = await pool.query(query, [title, year, tmdbId, fileId, quality, fileSize, addedBy]);
+  return result.rows[0].id;
+}
+
+async function searchMovie(query) {
+  const result = await pool.query(
+    `SELECT title, year, file_id, quality, file_size 
+     FROM movies 
+     WHERE title ILIKE $1
+     ORDER BY year DESC
+     LIMIT 10`,
+    [`%${query}%`]
+  );
+  return result.rows;
+}
+
+// ==================== TMDB ====================
+async function searchTMDB(query) {
+  try {
+    const url = `https://api.themoviedb.org/3/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(query)}`;
+    const response = await axios.get(url);
+    return response.data.results || [];
+  } catch (error) {
+    console.error('TMDB error:', error.message);
+    return [];
+  }
+}
+
+// ==================== SCRAPER ====================
+class MovieScraper {
+  constructor() {
+    this.client = axios.create({
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      timeout: 15000
+    });
+  }
+
+  async searchYts(query) {
+    try {
+      const searchUrl = `https://yts.mx/browse-movies/${encodeURIComponent(query)}/all/all/0/latest`;
+      const response = await this.client.get(searchUrl);
+      const $ = cheerio.load(response.data);
+      
+      const movieTile = $('.movie-tile').first();
+      if (!movieTile.length) return null;
+      
+      const link = movieTile.find('a').first();
+      if (!link.attr('href')) return null;
+      
+      const detailUrl = `https://yts.mx${link.attr('href')}`;
+      const detailResponse = await this.client.get(detailUrl);
+      const $$ = cheerio.load(detailResponse.data);
+      
+      const magnetTag = $$('a[href^="magnet:?"]').first();
+      if (magnetTag.length) {
+        return {
+          title: link.text().trim() || query,
+          magnet: magnetTag.attr('href'),
+          quality: '720p'
+        };
+      }
+    } catch (error) {
+      console.error('YTS error:', error.message);
+    }
+    return null;
+  }
+
+  async search1337x(query) {
+    try {
+      const searchUrl = `https://1337x.to/search/${encodeURIComponent(query)}/1/`;
+      const response = await this.client.get(searchUrl);
+      const $ = cheerio.load(response.data);
+      
+      const row = $('tr').first();
+      if (!row.length) return null;
+      
+      const nameTag = row.find('a.name').first();
+      if (!nameTag.length) return null;
+      
+      const magnetLink = row.find('a[href^="magnet:?"]').first();
+      if (magnetLink.length) {
+        return {
+          title: nameTag.text().trim(),
+          magnet: magnetLink.attr('href'),
+          quality: '1080p'
+        };
+      }
+    } catch (error) {
+      console.error('1337x error:', error.message);
+    }
+    return null;
+  }
+
+  async getDownloadLink(query) {
+    let result = await this.searchYts(query);
+    if (result) return result;
+    result = await this.search1337x(query);
+    if (result) return result;
+    return null;
+  }
+}
+
+// ==================== BOT ====================
 const bot = new Telegraf(BOT_TOKEN);
 const scraper = new MovieScraper();
 
-// Start
+// ---------- START ----------
 bot.start(async (ctx) => {
   await ctx.replyWithMarkdown(
-    `🎬 *Movie Download Bot*\n\n` +
+    `🎬 *CineverseAI Bot*\n\n` +
     `Send me a movie name to search.\n` +
     `Use: /search Inception or just type the name.\n\n` +
     `👑 *Admins:* Use /upload to add movies.`
   );
 });
 
-// Search command
+// ---------- SEARCH COMMAND ----------
 bot.command('search', async (ctx) => {
   const query = ctx.message.text.replace('/search', '').trim();
   if (!query) {
@@ -32,7 +174,7 @@ bot.command('search', async (ctx) => {
   await handleSearch(ctx, query);
 });
 
-// Upload command (admin only)
+// ---------- UPLOAD COMMAND (ADMIN ONLY) ----------
 bot.command('upload', async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id)) {
     return ctx.reply('⛔ Admin only.');
@@ -50,31 +192,24 @@ bot.command('upload', async (ctx) => {
   const year = parseInt(args[1].trim());
   const fileId = args[2].trim();
 
-  // Try TMDb lookup
+  // Get TMDb info
   let tmdbId = null;
-  try {
-    const tmdb = require('tmdb-api');
-    tmdb.apiKey = process.env.TMDB_API_KEY;
-    const results = await tmdb.searchMovies({ query: title });
-    if (results.results && results.results.length > 0) {
-      tmdbId = results.results[0].id;
-    }
-  } catch (error) {
-    console.error('TMDb lookup failed:', error.message);
+  const results = await searchTMDB(title);
+  if (results.length > 0) {
+    tmdbId = results[0].id;
   }
 
   await addMovie(title, year, tmdbId, fileId, '720p', 0, ctx.from.id);
   await ctx.reply(`✅ Added: *${title} (${year})*`, { parse_mode: 'Markdown' });
 });
 
-// Auto-search any text message
+// ---------- AUTO-SEARCH ANY TEXT ----------
 bot.on(message('text'), async (ctx) => {
-  // Ignore commands
   if (ctx.message.text.startsWith('/')) return;
   await handleSearch(ctx, ctx.message.text);
 });
 
-// Core search logic
+// ---------- CORE SEARCH LOGIC ----------
 async function handleSearch(ctx, query) {
   // 1. Check cache
   const cached = await searchMovie(query);
@@ -83,7 +218,7 @@ async function handleSearch(ctx, query) {
     return;
   }
 
-  // 2. Scrape online sources
+  // 2. Scrape online
   await ctx.reply('🔍 Searching online sources... (this may take 20-30s)');
   
   const result = await scraper.getDownloadLink(query);
@@ -115,6 +250,7 @@ async function handleSearch(ctx, query) {
   }
 }
 
+// ---------- SEND CACHED MOVIE ----------
 async function sendCachedMovie(ctx, movies) {
   for (const movie of movies.slice(0, 3)) {
     try {
@@ -134,18 +270,18 @@ async function sendCachedMovie(ctx, movies) {
   }
 }
 
-// Callback handlers
+// ---------- CALLBACK HANDLER ----------
 bot.action(/torrent_.+/, async (ctx) => {
   await ctx.answerCbQuery('Magnet link sent above. Use a torrent client.');
 });
 
-// Error handling
+// ---------- ERROR HANDLING ----------
 bot.catch((err, ctx) => {
   console.error('Bot error:', err);
   ctx.reply('⚠️ An error occurred. Please try again.');
 });
 
-// Start the bot
+// ==================== START ====================
 async function startBot() {
   try {
     await initDatabase();
