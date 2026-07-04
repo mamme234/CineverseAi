@@ -1,18 +1,20 @@
 {
   "name": "cineverse-ai-bot",
   "version": "1.0.0",
-  "description": "Telegram Movie Download Bot",
+  "description": "Telegram bot for movies and torrents",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.3",
-    "dotenv": "^16.4.5",
-    "axios": "^1.7.2",
-    "cheerio": "^1.0.0-rc.12"
+    "axios": "^1.6.7",
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.64.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": ["telegram", "bot", "movies", "torrents"],
+  "author": "Your Name",
+  "license": "MIT"
 }
