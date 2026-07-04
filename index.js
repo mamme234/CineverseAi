@@ -16,9 +16,8 @@ server.listen(PORT, '0.0.0.0', () => {
 
 // ==================== CONFIG ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2GB
 
-// ==================== MOVIE SCRAPER ====================
+// ==================== MOVIE/TV SCRAPER ====================
 class MovieScraper {
   constructor() {
     this.userAgents = [
@@ -40,89 +39,10 @@ class MovieScraper {
     };
   }
 
-  // ---------- SOURCE 1: YTS Proxy ----------
-  async searchYts(query) {
-    try {
-      // Use yts.mx with proxy or alternative domain
-      const domains = ['yts.mx', 'yts.uno', 'yts.ag', 'yts.pm'];
-      
-      for (const domain of domains) {
-        try {
-          const url = `https://${domain}/browse-movies/${encodeURIComponent(query)}/all/all/0/latest`;
-          const response = await axios.get(url, { 
-            headers: this.getHeaders(), 
-            timeout: 10000,
-            httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
-          });
-          
-          const $ = cheerio.load(response.data);
-          const movieTile = $('.movie-tile').first();
-          
-          if (movieTile.length) {
-            const link = movieTile.find('a').first();
-            if (link.attr('href')) {
-              const title = link.text().trim() || query;
-              const year = $('.year', movieTile).text().trim() || '';
-              
-              // Get detail page
-              const detailUrl = `https://${domain}${link.attr('href')}`;
-              const detailResponse = await axios.get(detailUrl, { 
-                headers: this.getHeaders(), 
-                timeout: 10000,
-                httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
-              });
-              const $$ = cheerio.load(detailResponse.data);
-              
-              const magnet = $$('a[href^="magnet:?"]').first().attr('href');
-              if (magnet) {
-                return {
-                  title: `${title} ${year}`.trim(),
-                  magnet: magnet,
-                  source: `YTS (${domain})`,
-                  quality: '720p/1080p'
-                };
-              }
-            }
-          }
-        } catch (e) {
-          console.log(`YTS ${domain} failed, trying next...`);
-          continue;
-        }
-      }
-    } catch (error) {
-      console.error('YTS error:', error.message);
-    }
-    return null;
-  }
-
-  // ---------- SOURCE 2: The Movie Database (Free API) ----------
-  async searchTmdb(query) {
-    try {
-      // Use the free TMDb API without key (limited)
-      const url = `https://api.themoviedb.org/3/search/movie?api_key=019e8f1102b6bbf4a3c2be3854a6cfc1&query=${encodeURIComponent(query)}`;
-      const response = await axios.get(url, { timeout: 10000 });
-      
-      if (response.data.results && response.data.results.length > 0) {
-        const movie = response.data.results[0];
-        return {
-          title: movie.title,
-          year: movie.release_date ? movie.release_date.split('-')[0] : '',
-          poster: `https://image.tmdb.org/t/p/w200${movie.poster_path}`,
-          rating: movie.vote_average,
-          overview: movie.overview,
-          tmdb_id: movie.id
-        };
-      }
-    } catch (error) {
-      console.error('TMDb error:', error.message);
-    }
-    return null;
-  }
-
-  // ---------- SOURCE 3: 1337x Proxy ----------
+  // ---------- SOURCE 1: 1337x (Movies + TV) ----------
   async search1337x(query) {
     try {
-      const domains = ['1337x.to', 'x1337x.ws', '1337x.gd'];
+      const domains = ['1337x.to', 'x1337x.ws', '1337x.gd', '1337x.st'];
       
       for (const domain of domains) {
         try {
@@ -134,20 +54,40 @@ class MovieScraper {
           });
           
           const $ = cheerio.load(response.data);
-          const row = $('tr').first();
+          const rows = $('tr');
           
-          if (row.length) {
-            const nameTag = row.find('a.name').first();
-            const magnetLink = row.find('a[href^="magnet:?"]').first();
+          const results = [];
+          rows.each((i, row) => {
+            if (i === 0) return;
+            const nameTag = $(row).find('a.name');
+            const magnetLink = $(row).find('a[href^="magnet:?"]');
+            const seeds = $(row).find('td').eq(4).text().trim() || '0';
+            const size = $(row).find('td').eq(3).text().trim() || 'Unknown';
+            const type = $(row).find('td').eq(1).text().trim() || 'Unknown';
             
             if (nameTag.length && magnetLink.length) {
-              return {
+              results.push({
                 title: nameTag.text().trim(),
                 magnet: magnetLink.attr('href'),
-                source: `1337x (${domain})`,
-                quality: '1080p'
-              };
+                seeds: parseInt(seeds) || 0,
+                size: size,
+                type: type
+              });
             }
+          });
+          
+          // Sort by seeds (most popular first)
+          results.sort((a, b) => b.seeds - a.seeds);
+          
+          if (results.length > 0) {
+            return {
+              title: results[0].title,
+              magnet: results[0].magnet,
+              source: `1337x (${domain})`,
+              quality: results[0].size,
+              seeds: results[0].seeds,
+              allResults: results.slice(0, 5)
+            };
           }
         } catch (e) {
           console.log(`1337x ${domain} failed, trying next...`);
@@ -160,38 +100,7 @@ class MovieScraper {
     return null;
   }
 
-  // ---------- SOURCE 4: RARBG Proxy ----------
-  async searchRarbg(query) {
-    try {
-      const url = `https://rarbg.to/torrents.php?search=${encodeURIComponent(query)}`;
-      const response = await axios.get(url, { 
-        headers: this.getHeaders(), 
-        timeout: 10000 
-      });
-      
-      const $ = cheerio.load(response.data);
-      const row = $('tr.lista2').first();
-      
-      if (row.length) {
-        const nameTag = row.find('a').first();
-        const magnetLink = row.find('a[href^="magnet:?"]').first();
-        
-        if (nameTag.length && magnetLink.length) {
-          return {
-            title: nameTag.text().trim(),
-            magnet: magnetLink.attr('href'),
-            source: 'RARBG',
-            quality: '1080p'
-          };
-        }
-      }
-    } catch (error) {
-      console.error('RARBG error:', error.message);
-    }
-    return null;
-  }
-
-  // ---------- SOURCE 5: TORRENTGALAXY ----------
+  // ---------- SOURCE 2: TORRENTGALAXY (TV Series) ----------
   async searchTorrentgalaxy(query) {
     try {
       const url = `https://torrentgalaxy.to/torrents.php?search=${encodeURIComponent(query)}`;
@@ -201,20 +110,33 @@ class MovieScraper {
       });
       
       const $ = cheerio.load(response.data);
-      const row = $('tr.tgxtable').first();
+      const rows = $('tr.tgxtable');
       
-      if (row.length) {
-        const nameTag = row.find('a.tx');
-        const magnetLink = row.find('a[href^="magnet:?"]');
+      const results = [];
+      rows.each((i, row) => {
+        const nameTag = $(row).find('a.tx');
+        const magnetLink = $(row).find('a[href^="magnet:?"]');
+        const seeds = $(row).find('td').eq(4).text().trim() || '0';
         
         if (nameTag.length && magnetLink.length) {
-          return {
+          results.push({
             title: nameTag.text().trim(),
             magnet: magnetLink.attr('href'),
-            source: 'TorrentGalaxy',
-            quality: '1080p'
-          };
+            seeds: parseInt(seeds) || 0
+          });
         }
+      });
+      
+      results.sort((a, b) => b.seeds - a.seeds);
+      
+      if (results.length > 0) {
+        return {
+          title: results[0].title,
+          magnet: results[0].magnet,
+          source: 'TorrentGalaxy',
+          quality: 'TV Series',
+          seeds: results[0].seeds
+        };
       }
     } catch (error) {
       console.error('Torrentgalaxy error:', error.message);
@@ -222,17 +144,154 @@ class MovieScraper {
     return null;
   }
 
+  // ---------- SOURCE 3: TORRENTREACTOR (TV Series) ----------
+  async searchTorrentreactor(query) {
+    try {
+      const url = `https://torrentreactor.to/search/${encodeURIComponent(query)}/`;
+      const response = await axios.get(url, { 
+        headers: this.getHeaders(), 
+        timeout: 10000 
+      });
+      
+      const $ = cheerio.load(response.data);
+      const rows = $('tr.highlight');
+      
+      const results = [];
+      rows.each((i, row) => {
+        const nameTag = $(row).find('a');
+        const magnetLink = $(row).find('a[href^="magnet:?"]');
+        const seeds = $(row).find('td').eq(3).text().trim() || '0';
+        
+        if (nameTag.length && magnetLink.length) {
+          results.push({
+            title: nameTag.first().text().trim(),
+            magnet: magnetLink.attr('href'),
+            seeds: parseInt(seeds) || 0
+          });
+        }
+      });
+      
+      results.sort((a, b) => b.seeds - a.seeds);
+      
+      if (results.length > 0) {
+        return {
+          title: results[0].title,
+          magnet: results[0].magnet,
+          source: 'TorrentReactor',
+          quality: 'TV Series',
+          seeds: results[0].seeds
+        };
+      }
+    } catch (error) {
+      console.error('Torrentreactor error:', error.message);
+    }
+    return null;
+  }
+
+  // ---------- SOURCE 4: MOVIESJOY (Turkish Series) ----------
+  async searchMoviesjoy(query) {
+    try {
+      const url = `https://moviesjoy.to/search/${encodeURIComponent(query)}`;
+      const response = await axios.get(url, { 
+        headers: this.getHeaders(), 
+        timeout: 10000 
+      });
+      
+      const $ = cheerio.load(response.data);
+      const result = $('.ml-item').first();
+      
+      if (result.length) {
+        const link = result.find('a').first();
+        const title = result.find('.mli-info h2').text().trim() || query;
+        
+        if (link.attr('href')) {
+          return {
+            title: title,
+            magnet: null, // Moviesjoy uses direct links, not magnet
+            source: 'MoviesJoy (Turkish)',
+            quality: 'Stream/Download',
+            url: `https://moviesjoy.to${link.attr('href')}`,
+            isDirect: true
+          };
+        }
+      }
+    } catch (error) {
+      console.error('Moviesjoy error:', error.message);
+    }
+    return null;
+  }
+
+  // ---------- SOURCE 5: DIZICLUB (Turkish Series) ----------
+  async searchDiziclub(query) {
+    try {
+      const url = `https://diziclub.com/search/${encodeURIComponent(query)}`;
+      const response = await axios.get(url, { 
+        headers: this.getHeaders(), 
+        timeout: 10000 
+      });
+      
+      const $ = cheerio.load(response.data);
+      const result = $('.search-item').first();
+      
+      if (result.length) {
+        const link = result.find('a').first();
+        const title = result.find('.si-title').text().trim() || query;
+        
+        if (link.attr('href')) {
+          return {
+            title: title,
+            magnet: null,
+            source: 'DiziClub (Turkish)',
+            quality: 'Turkish Series',
+            url: `https://diziclub.com${link.attr('href')}`,
+            isDirect: true
+          };
+        }
+      }
+    } catch (error) {
+      console.error('Diziclub error:', error.message);
+    }
+    return null;
+  }
+
+  // ---------- SOURCE 6: TMDb (Metadata) ----------
+  async searchTmdb(query) {
+    try {
+      const url = `https://api.themoviedb.org/3/search/multi?api_key=019e8f1102b6bbf4a3c2be3854a6cfc1&query=${encodeURIComponent(query)}`;
+      const response = await axios.get(url, { timeout: 10000 });
+      
+      if (response.data.results && response.data.results.length > 0) {
+        const item = response.data.results[0];
+        const isTV = item.media_type === 'tv';
+        
+        return {
+          title: item.title || item.name || query,
+          year: item.release_date ? item.release_date.split('-')[0] : (item.first_air_date ? item.first_air_date.split('-')[0] : ''),
+          poster: item.poster_path ? `https://image.tmdb.org/t/p/w200${item.poster_path}` : null,
+          rating: item.vote_average,
+          overview: item.overview,
+          type: isTV ? 'TV Series' : 'Movie',
+          mediaType: item.media_type
+        };
+      }
+    } catch (error) {
+      console.error('TMDb error:', error.message);
+    }
+    return null;
+  }
+
   // ---------- MAIN SEARCH ----------
   async searchMovie(query) {
-    // Try TMDb for metadata
+    // Get metadata
     const metadata = await this.searchTmdb(query);
     
     // Try all sources in parallel
     const sources = [
-      this.searchYts(query),
       this.search1337x(query),
-      this.searchRarbg(query),
-      this.searchTorrentgalaxy(query)
+      this.searchTorrentgalaxy(query),
+      this.searchTorrentreactor(query),
+      this.searchMoviesjoy(query),
+      this.searchDiziclub(query)
     ];
     
     const results = await Promise.allSettled(sources);
@@ -243,9 +302,11 @@ class MovieScraper {
         if (metadata) {
           movie.title = metadata.title || movie.title;
           movie.year = metadata.year || movie.year;
-          movie.poster = metadata.poster;
+          movie.poster = metadata.poster || movie.poster;
           movie.rating = metadata.rating;
           movie.overview = metadata.overview;
+          movie.mediaType = metadata.mediaType;
+          movie.type = metadata.type;
         }
         return movie;
       }
@@ -262,17 +323,15 @@ const scraper = new MovieScraper();
 // ---------- START ----------
 bot.start(async (ctx) => {
   await ctx.replyWithMarkdown(
-    `🎬 *CineverseAI Bot v2*\n\n` +
-    `Send me a movie name and I'll find download links!\n\n` +
-    `Examples:\n` +
-    `\`Inception\`\n` +
-    `\`The Dark Knight\`\n` +
-    `\`Turkish series\`\n` +
-    `\`Kdrama\`\n\n` +
-    `📡 Searching: YTS, 1337x, RARBG, TorrentGalaxy\n` +
-    `⚡ Multiple sources for best results\n\n` +
-    `🇹🇷 Turkish: Try "Eşref Rüya" or "Kurtlar Vadisi"\n` +
-    `🇰🇷 Korean: Try "Squid Game" or "Crash Landing on You"`
+    `🎬 *CineverseAI Bot v3*\n\n` +
+    `Send me a movie or TV series name!\n\n` +
+    `📺 *Supported:*\n` +
+    `• Hollywood Movies\n` +
+    `• Turkish Series (Eşref Rüya, Kurtlar Vadisi)\n` +
+    `• K-Dramas (Squid Game, Crash Landing)\n` +
+    `• Anime (Naruto, Demon Slayer)\n\n` +
+    `📡 Searching: 1337x, TorrentGalaxy, MoviesJoy, DiziClub\n` +
+    `⚡ Finds both Movies AND TV Series`
   );
 });
 
@@ -280,17 +339,20 @@ bot.start(async (ctx) => {
 bot.command('help', async (ctx) => {
   await ctx.replyWithMarkdown(
     `📖 *How to use:*\n\n` +
-    `1. Send any movie name\n` +
+    `1. Send any movie or series name\n` +
     `2. I'll search multiple sources\n` +
     `3. Get a magnet link\n` +
     `4. Open in your torrent client\n\n` +
-    `⚠️ *Use a VPN for privacy*\n` +
-    `⚠️ *Some sources may be blocked in your region*\n\n` +
-    `🔍 *Tips for better results:*\n` +
-    `• Use the English title for Hollywood movies\n` +
-    `• For Turkish: Try the original name\n` +
-    `• For K-Dramas: Use the English title\n` +
-    `• Add the year (e.g., "Inception 2010")`
+    `🔍 *Turkish Series Search:*\n` +
+    `• Eşref Rüya\n` +
+    `• Kurtlar Vadisi\n` +
+    `• Diriliş Ertuğrul\n` +
+    `• Muhteşem Yüzyıl\n\n` +
+    `🔍 *K-Dramas:*\n` +
+    `• Squid Game\n` +
+    `• Crash Landing on You\n` +
+    `• Descendants of the Sun\n\n` +
+    `⚠️ *Use a VPN for privacy*`
   );
 });
 
@@ -310,12 +372,19 @@ async function handleSearch(ctx, query) {
     if (!result) {
       await ctx.reply(
         `❌ No results found for *${query}*.\n\n` +
-        `Try:\n` +
-        `• Using the English title\n` +
-        `• For Turkish: Try "Kurtlar Vadisi" or "Eşref Rüya"\n` +
-        `• For K-Dramas: Try "Squid Game" or "Crash Landing"\n` +
-        `• Adding the year (e.g., "Inception 2010")\n` +
-        `• A different movie\n\n` +
+        `🔍 *Tips for better results:*\n\n` +
+        `📺 *Turkish Series:*\n` +
+        `• Eşref Rüya\n` +
+        `• Kurtlar Vadisi\n` +
+        `• Diriliş Ertuğrul\n` +
+        `• Muhteşem Yüzyıl\n\n` +
+        `🇰🇷 *K-Dramas:*\n` +
+        `• Squid Game\n` +
+        `• Crash Landing on You\n` +
+        `• Descendants of the Sun\n\n` +
+        `🎬 *Hollywood:*\n` +
+        `• Use English titles\n` +
+        `• Add year (e.g., "Inception 2010")\n\n` +
         `ℹ️ Some sources may be blocked. Try again with a VPN.`,
         { parse_mode: 'Markdown' }
       );
@@ -325,10 +394,12 @@ async function handleSearch(ctx, query) {
     // Build response
     let message = `🎬 *${result.title}*`;
     if (result.year) message += ` (${result.year})`;
+    if (result.type) message += `\n📺 Type: ${result.type}`;
     if (result.rating) message += `\n⭐ Rating: ${result.rating}/10`;
     if (result.overview) message += `\n\n📝 ${result.overview.substring(0, 300)}...`;
     message += `\n\n📡 Source: ${result.source}`;
     message += `\n📦 Quality: ${result.quality}`;
+    if (result.seeds) message += `\n🌱 Seeds: ${result.seeds}`;
     
     // Send poster if available
     if (result.poster) {
@@ -344,7 +415,7 @@ async function handleSearch(ctx, query) {
       await ctx.replyWithMarkdown(message);
     }
     
-    // Send magnet link
+    // Send magnet link or direct URL
     if (result.magnet) {
       await ctx.replyWithMarkdown(
         `🧲 *Magnet Link*\n\n` +
@@ -356,6 +427,13 @@ async function handleSearch(ctx, query) {
         `4. Wait for the download\n\n` +
         `⚠️ *Use a VPN for privacy and faster speeds*`
       );
+    } else if (result.url) {
+      await ctx.replyWithMarkdown(
+        `🔗 *Direct Link*\n\n` +
+        `You can watch/download here:\n` +
+        `[Click to Watch](${result.url})\n\n` +
+        `⚠️ *This is a streaming site, may have pop-ups*`
+      );
     } else {
       await ctx.reply('❌ No download link found.');
     }
@@ -364,7 +442,7 @@ async function handleSearch(ctx, query) {
     console.error('Search error:', error.message);
     await ctx.reply(
       `❌ Error: ${error.message}\n\n` +
-      `Try a different movie or search term.`
+      `Try a different movie or series name.`
     );
   }
 }
