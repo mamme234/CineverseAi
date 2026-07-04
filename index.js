@@ -1,16 +1,10 @@
 require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
-const { message } = require('telegraf/filters');
+const { Telegraf } = require('telegraf');
 const axios = require('axios');
-const http = require('http');
 const cheerio = require('cheerio');
-const fs = require('fs');
-const path = require('path');
-const { pipeline } = require('stream');
-const { promisify } = require('util');
-const streamPipeline = promisify(pipeline);
+const http = require('http');
 
-// ==================== DUMMY HTTP SERVER FOR RENDER ====================
+// ==================== HTTP SERVER FOR RENDER ====================
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
@@ -22,27 +16,25 @@ server.listen(PORT, '0.0.0.0', () => {
 
 // ==================== CONFIG ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2GB (Telegram limit)
+const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2GB
 
-// ==================== SCRAPER ====================
+// ==================== MOVIE SCRAPER ====================
 class MovieScraper {
   constructor() {
     this.client = axios.create({
       headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       },
       timeout: 30000
     });
   }
 
-  // Search for movie on multiple sites
+  // Search multiple sites for movies
   async searchMovie(query) {
-    // Try various sources for direct download links
     const sources = [
-      this.searchMovieWeb(query),
       this.searchDlMovie(query),
-      this.searchMkvCinema(query)
+      this.searchMkvCinema(query),
+      this.searchMovieWeb(query)
     ];
     
     for (const source of sources) {
@@ -52,36 +44,11 @@ class MovieScraper {
     return null;
   }
 
-  // Source 1: movie-web.app
-  async searchMovieWeb(query) {
-    try {
-      const searchUrl = `https://movie-web.app/search?q=${encodeURIComponent(query)}`;
-      const response = await this.client.get(searchUrl, { responseType: 'text' });
-      const $ = cheerio.load(response.data);
-      
-      // Find the first movie result and get its embed URL
-      const movieLink = $('.movie-card a').first();
-      if (movieLink.length) {
-        const movieId = movieLink.attr('href');
-        if (movieId) {
-          return {
-            title: movieLink.find('.title').text().trim() || query,
-            embedUrl: `https://movie-web.app${movieId}`,
-            source: 'movie-web'
-          };
-        }
-      }
-    } catch (error) {
-      console.error('Movie-web error:', error.message);
-    }
-    return null;
-  }
-
-  // Source 2: dlmovie.com
+  // Source 1: dlmovie.com
   async searchDlMovie(query) {
     try {
       const searchUrl = `https://dlmovie.com/search/${encodeURIComponent(query)}`;
-      const response = await this.client.get(searchUrl, { responseType: 'text' });
+      const response = await this.client.get(searchUrl);
       const $ = cheerio.load(response.data);
       
       const result = $('.movie-item').first();
@@ -102,11 +69,11 @@ class MovieScraper {
     return null;
   }
 
-  // Source 3: mkvcinema.com
+  // Source 2: mkvcinema.com
   async searchMkvCinema(query) {
     try {
       const searchUrl = `https://mkvcinema.com/?s=${encodeURIComponent(query)}`;
-      const response = await this.client.get(searchUrl, { responseType: 'text' });
+      const response = await this.client.get(searchUrl);
       const $ = cheerio.load(response.data);
       
       const result = $('.post').first();
@@ -127,31 +94,63 @@ class MovieScraper {
     return null;
   }
 
-  // Get actual video download URL from embed page
-  async getVideoUrl(embedUrl) {
+  // Source 3: movie-web.app
+  async searchMovieWeb(query) {
     try {
-      const response = await this.client.get(embedUrl, { responseType: 'text' });
+      const searchUrl = `https://movie-web.app/search?q=${encodeURIComponent(query)}`;
+      const response = await this.client.get(searchUrl);
       const $ = cheerio.load(response.data);
       
-      // Try to find video source
-      // Method 1: Check for video tag
-      const videoSrc = $('video source').attr('src');
-      if (videoSrc) return videoSrc;
-      
-      // Method 2: Check for iframe
-      const iframeSrc = $('iframe').first().attr('src');
-      if (iframeSrc) {
-        // Recurse into iframe
-        return await this.getVideoUrl(iframeSrc);
+      const movieLink = $('.movie-card a').first();
+      if (movieLink.length) {
+        const movieId = movieLink.attr('href');
+        if (movieId) {
+          return {
+            title: movieLink.find('.title').text().trim() || query,
+            embedUrl: `https://movie-web.app${movieId}`,
+            source: 'movie-web'
+          };
+        }
       }
+    } catch (error) {
+      console.error('Movie-web error:', error.message);
+    }
+    return null;
+  }
+
+  // Get actual video URL from embed page
+  async getVideoUrl(embedUrl) {
+    try {
+      const response = await this.client.get(embedUrl);
+      const $ = cheerio.load(response.data);
       
-      // Method 3: Check for direct links in script or a tags
-      const downloadLink = $('a[download], a[href*=".mp4"], a[href*=".mkv"]').first().attr('href');
-      if (downloadLink) return downloadLink;
+      // Try various patterns
+      const patterns = [
+        'video source',
+        '[data-src*=".mp4"]',
+        '[data-video]',
+        'a[download]',
+        'a[href*=".mp4"]',
+        'a[href*=".mkv"]',
+        'iframe'
+      ];
       
-      // Method 4: Check data attributes
-      const dataSrc = $('[data-src*=".mp4"], [data-video]').attr('data-src');
-      if (dataSrc) return dataSrc;
+      for (const pattern of patterns) {
+        const element = $(pattern).first();
+        if (element.length) {
+          let src = element.attr('src') || element.attr('href') || element.attr('data-src');
+          if (src) {
+            if (src.startsWith('//')) src = 'https:' + src;
+            if (!src.startsWith('http') && src.startsWith('/')) {
+              const baseUrl = embedUrl.split('/').slice(0, 3).join('/');
+              src = baseUrl + src;
+            }
+            if (src.startsWith('http')) {
+              return src;
+            }
+          }
+        }
+      }
       
       return null;
     } catch (error) {
@@ -163,19 +162,14 @@ class MovieScraper {
   // Download video file
   async downloadVideo(videoUrl) {
     try {
-      // Validate URL
-      if (!videoUrl) throw new Error('No video URL found');
-      
-      // Create a new axios instance for downloading
       const downloadClient = axios.create({
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Referer': 'https://www.google.com/'
         },
         responseType: 'stream',
-        timeout: 120000, // 2 minutes
-        maxContentLength: MAX_FILE_SIZE,
-        maxBodyLength: MAX_FILE_SIZE
+        timeout: 120000,
+        maxContentLength: MAX_FILE_SIZE
       });
       
       const response = await downloadClient.get(videoUrl);
@@ -210,42 +204,40 @@ class MovieScraper {
 const bot = new Telegraf(BOT_TOKEN);
 const scraper = new MovieScraper();
 
-// ---------- START ----------
+// Start command
 bot.start(async (ctx) => {
   await ctx.replyWithMarkdown(
-    `🎬 *CineverseAI Bot - Direct Download*\n\n` +
-    `Send me a movie name and I'll send it to you!\n\n` +
+    `🎬 *CineverseAI Bot*\n\n` +
+    `Send me a movie name and I'll download it for you!\n\n` +
     `Examples:\n` +
     `\`Inception\`\n` +
     `\`The Dark Knight\`\n` +
-    `\`Avengers 2012\`\n\n` +
-    `⚡ Files up to 2GB\n` +
-    `⏱️ Large files may take 3-5 minutes\n` +
+    `\`Turkish series\`\n` +
+    `\`Kdrama\`\n\n` +
+    `⏱️ Large files take 2-5 minutes\n` +
     `📱 Works on any device`
   );
 });
 
-// ---------- HELP ----------
+// Help command
 bot.command('help', async (ctx) => {
   await ctx.replyWithMarkdown(
     `📖 *How to use:*\n\n` +
     `1. Send any movie name\n` +
-    `2. I'll search for direct download links\n` +
-    `3. I download the movie\n` +
-    `4. You receive the video file directly\n\n` +
-    `⚠️ *Keep the chat open during download*\n` +
-    `⚠️ *Large files take 3-5 minutes*\n` +
-    `⚠️ *Make sure you have enough storage*`
+    `2. I'll search for download links\n` +
+    `3. I download and send the file\n` +
+    `4. Tap to watch\n\n` +
+    `⚠️ Keep the chat open during download`
   );
 });
 
-// ---------- AUTO-SEARCH ANY TEXT ----------
-bot.on(message('text'), async (ctx) => {
+// Auto-search any text message
+bot.on('text', async (ctx) => {
   if (ctx.message.text.startsWith('/')) return;
   await handleSearch(ctx, ctx.message.text);
 });
 
-// ---------- CORE SEARCH LOGIC ----------
+// Core search logic
 async function handleSearch(ctx, query) {
   const statusMsg = await ctx.reply(`🔍 Searching for *${query}*...`, { parse_mode: 'Markdown' });
   
@@ -272,34 +264,32 @@ async function handleSearch(ctx, query) {
     if (!videoUrl) {
       await ctx.reply(
         `❌ Could not find a direct download link for *${movieInfo.title}*.\n\n` +
-        `The movie may be on a platform that doesn't allow direct downloads.`,
+        `Try a different movie or site.`,
         { parse_mode: 'Markdown' }
       );
       return;
     }
     
-    // Step 3: Download video
+    // Step 3: Download
     await ctx.reply(
       `📥 Downloading *${movieInfo.title}*\n` +
-      `⏳ This may take 3-5 minutes...\n` +
-      `📦 Max size: 2GB`,
+      `⏳ Please wait 2-5 minutes...`,
       { parse_mode: 'Markdown' }
     );
     
     const videoBuffer = await scraper.downloadVideo(videoUrl);
     
-    // Step 4: Send video
+    // Step 4: Send
     const fileName = `${movieInfo.title}.mp4`;
     await ctx.replyWithVideo(
       { source: videoBuffer, filename: fileName },
       { 
         caption: `🎬 *${movieInfo.title}*\n✅ Download complete!`,
-        parse_mode: 'Markdown',
-        supports_streaming: true
+        parse_mode: 'Markdown'
       }
     );
     
-    await ctx.reply('✅ Movie sent successfully! Enjoy watching 🎥');
+    await ctx.reply('✅ Movie sent! Enjoy watching 🎥');
     
   } catch (error) {
     console.error('Search/Download error:', error.message);
@@ -307,24 +297,23 @@ async function handleSearch(ctx, query) {
       `❌ Error: ${error.message}\n\n` +
       `Try:\n` +
       `• A different movie\n` +
-      `• A smaller file size\n` +
+      `• A smaller file\n` +
       `• Using the English title`
     );
   }
 }
 
-// ---------- ERROR HANDLING ----------
+// Error handling
 bot.catch((err, ctx) => {
   console.error('Bot error:', err);
   ctx.reply('⚠️ An error occurred. Please try again.');
 });
 
-// ==================== START ====================
+// Start bot
 async function startBot() {
   try {
     await bot.launch();
     console.log('✅ Bot is running!');
-    console.log(`📡 Bot username: @${bot.botInfo.username}`);
   } catch (error) {
     console.error('❌ Failed to start bot:', error);
     process.exit(1);
@@ -332,13 +321,3 @@ async function startBot() {
 }
 
 startBot();
-
-// Graceful shutdown
-process.once('SIGINT', () => {
-  bot.stop('SIGINT');
-  process.exit(0);
-});
-process.once('SIGTERM', () => {
-  bot.stop('SIGTERM');
-  process.exit(0);
-});
