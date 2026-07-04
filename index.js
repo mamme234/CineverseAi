@@ -7,106 +7,22 @@ const cheerio = require('cheerio');
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const tmdbApiKey = process.env.TMDB_API_KEY;
 
-// Check if token exists
 if (!token) {
-    console.error('❌ TELEGRAM_BOT_TOKEN is not set in environment variables!');
+    console.error('❌ TELEGRAM_BOT_TOKEN is not set!');
     process.exit(1);
 }
 
 if (!tmdbApiKey) {
-    console.error('❌ TMDB_API_KEY is not set in environment variables!');
+    console.error('❌ TMDB_API_KEY is not set!');
     process.exit(1);
 }
 
 // ============ INITIALIZE BOT ============
-let bot;
-try {
-    bot = new TelegramBot(token, { 
-        polling: true,
-        onlyFirstMatch: true
-    });
-    console.log('✅ Bot initialized successfully');
-} catch (error) {
-    console.error('❌ Failed to initialize bot:', error.message);
-    process.exit(1);
-}
+const bot = new TelegramBot(token, { polling: true });
+console.log('✅ Bot initialized successfully');
 
 // ============ USER STATES ============
 const userStates = {};
-
-// ============ TORRENT SOURCES ============
-const torrentSources = [
-    {
-        name: '1337x',
-        baseUrl: 'https://1337x.to',
-        searchUrl: (query) => `https://1337x.to/search/${encodeURIComponent(query)}/1/`,
-        parse: (html) => {
-            const $ = cheerio.load(html);
-            const results = [];
-            $('tbody tr').each((i, el) => {
-                if (i >= 5) return false;
-                const name = $(el).find('.name a').last().text().trim();
-                const magnet = $(el).find('.magnet-download a').attr('href');
-                const seeds = $(el).find('.seeds').text().trim();
-                const size = $(el).find('.size').text().trim();
-                if (name && magnet) {
-                    results.push({ name, magnet, seeds, size, source: '1337x' });
-                }
-            });
-            return results;
-        }
-    },
-    {
-        name: 'ThePirateBay',
-        baseUrl: 'https://thepiratebay.org',
-        searchUrl: (query) => `https://thepiratebay.org/search/${encodeURIComponent(query)}/0/99/0`,
-        parse: (html) => {
-            const $ = cheerio.load(html);
-            const results = [];
-            $('#searchResult tbody tr').each((i, el) => {
-                if (i >= 5) return false;
-                const name = $(el).find('.detLink').text().trim();
-                const magnet = $(el).find('a[href^="magnet:"]').attr('href');
-                const seeds = $(el).find('td').eq(2).text().trim();
-                const size = $(el).find('.detDesc').text().match(/Size ([\d.]+ [A-Z]+)/)?.[1] || 'N/A';
-                if (name && magnet) {
-                    results.push({ name, magnet, seeds, size, source: 'TPB' });
-                }
-            });
-            return results;
-        }
-    },
-    {
-        name: 'YTS',
-        baseUrl: 'https://yts.mx',
-        searchUrl: (query) => `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(query)}&limit=5`,
-        parse: async (response) => {
-            try {
-                const data = response.data;
-                const results = [];
-                if (data.data && data.data.movies) {
-                    for (const movie of data.data.movies) {
-                        if (movie.torrents) {
-                            for (const torrent of movie.torrents) {
-                                results.push({
-                                    name: `${movie.title} (${movie.year}) - ${torrent.quality} ${torrent.type}`,
-                                    magnet: torrent.magnet || `https://yts.mx/torrent/download/${torrent.hash}`,
-                                    seeds: torrent.seeds || 'N/A',
-                                    size: torrent.size || 'N/A',
-                                    source: 'YTS'
-                                });
-                            }
-                        }
-                    }
-                }
-                return results.slice(0, 5);
-            } catch (error) {
-                console.error('YTS parse error:', error.message);
-                return [];
-            }
-        }
-    }
-];
 
 // ============ MAIN MENU ============
 bot.onText(/\/start/, (msg) => {
@@ -149,15 +65,8 @@ bot.on('callback_query', async (callbackQuery) => {
         console.error('Error answering callback:', error.message);
     }
     
-    // Handle torrent callback
     if (action && action.startsWith('torrent_')) {
         await handleTorrentSearch(chatId, action);
-        return;
-    }
-    
-    // Handle more torrents
-    if (action && action.startsWith('more_torrents_')) {
-        await handleMoreTorrents(chatId, action);
         return;
     }
     
@@ -193,33 +102,7 @@ bot.on('callback_query', async (callbackQuery) => {
             break;
             
         case 'main_menu':
-            try {
-                await bot.editMessageText(
-                    '🎥 *Welcome to CineverseAI Bot!*\n\nChoose an option below:',
-                    {
-                        chat_id: chatId,
-                        message_id: messageId,
-                        parse_mode: 'Markdown',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [
-                                    { text: '🎬 Search Movies', callback_data: 'search_movie' },
-                                    { text: '📺 Search TV Shows', callback_data: 'search_tv' }
-                                ],
-                                [
-                                    { text: '🔥 Trending', callback_data: 'trending' },
-                                    { text: '⭐ Popular', callback_data: 'popular' }
-                                ],
-                                [
-                                    { text: '❓ Help', callback_data: 'help' }
-                                ]
-                            ]
-                        }
-                    }
-                );
-            } catch (error) {
-                console.error('Error returning to main menu:', error.message);
-            }
+            showMainMenu(chatId);
             break;
             
         case 'help':
@@ -311,43 +194,155 @@ async function performSearch(chatId, query, type) {
     }
 }
 
-// ============ TORRENT SEARCH ============
+// ============ IMPROVED TORRENT SEARCH ============
 async function searchTorrents(query) {
     const allResults = [];
     
-    for (const source of torrentSources) {
-        try {
-            console.log(`🔍 Searching ${source.name} for: ${query}`);
-            
-            if (source.name === 'YTS') {
-                // YTS uses JSON API
-                const response = await axios.get(source.searchUrl(query), {
-                    timeout: 10000,
+    // Clean query for better search
+    const cleanQuery = query.replace(/[^\w\s]/g, '').trim();
+    
+    console.log(`🔍 Searching torrents for: "${cleanQuery}"`);
+    
+    // Try different search methods
+    const searchMethods = [
+        // Method 1: 1337x
+        async () => {
+            try {
+                const url = `https://1337x.to/search/${encodeURIComponent(cleanQuery)}/1/`;
+                const response = await axios.get(url, {
+                    timeout: 15000,
                     headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1'
                     }
                 });
-                const results = await source.parse(response);
-                allResults.push(...results);
-            } else {
-                // HTML scrapers
-                const response = await axios.get(source.searchUrl(query), {
-                    timeout: 10000,
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                
+                const $ = cheerio.load(response.data);
+                const results = [];
+                
+                $('tbody tr').each((i, el) => {
+                    if (i >= 3) return false;
+                    const name = $(el).find('.name a').last().text().trim();
+                    const magnet = $(el).find('.magnet-download a').attr('href');
+                    const seeds = $(el).find('.seeds').text().trim();
+                    const size = $(el).find('.size').text().trim();
+                    
+                    if (name && magnet && name.length > 3) {
+                        results.push({
+                            name: name.substring(0, 60),
+                            magnet: magnet,
+                            seeds: seeds || 'N/A',
+                            size: size || 'N/A',
+                            source: '1337x'
+                        });
                     }
                 });
-                const results = source.parse(response.data);
-                allResults.push(...results);
+                
+                return results;
+            } catch (error) {
+                console.log('1337x error:', error.message);
+                return [];
             }
-            
-            if (allResults.length >= 5) break;
-            
-        } catch (error) {
-            console.error(`❌ ${source.name} error:`, error.message);
+        },
+        
+        // Method 2: TPB
+        async () => {
+            try {
+                const url = `https://thepiratebay.org/search/${encodeURIComponent(cleanQuery)}/0/99/0`;
+                const response = await axios.get(url, {
+                    timeout: 15000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    }
+                });
+                
+                const $ = cheerio.load(response.data);
+                const results = [];
+                
+                $('#searchResult tbody tr').each((i, el) => {
+                    if (i >= 3) return false;
+                    const name = $(el).find('.detLink').text().trim();
+                    const magnet = $(el).find('a[href^="magnet:"]').attr('href');
+                    const seeds = $(el).find('td').eq(2).text().trim();
+                    const sizeText = $(el).find('.detDesc').text();
+                    const size = sizeText.match(/Size ([\d.]+ [A-Z]+)/)?.[1] || 'N/A';
+                    
+                    if (name && magnet && name.length > 3) {
+                        results.push({
+                            name: name.substring(0, 60),
+                            magnet: magnet,
+                            seeds: seeds || 'N/A',
+                            size: size || 'N/A',
+                            source: 'TPB'
+                        });
+                    }
+                });
+                
+                return results;
+            } catch (error) {
+                console.log('TPB error:', error.message);
+                return [];
+            }
+        },
+        
+        // Method 3: YTS API
+        async () => {
+            try {
+                const url = `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(cleanQuery)}&limit=3`;
+                const response = await axios.get(url, {
+                    timeout: 10000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                });
+                
+                const results = [];
+                if (response.data.data && response.data.data.movies) {
+                    for (const movie of response.data.data.movies) {
+                        if (movie.torrents) {
+                            for (const torrent of movie.torrents) {
+                                results.push({
+                                    name: `${movie.title} (${movie.year}) - ${torrent.quality} ${torrent.type}`.substring(0, 60),
+                                    magnet: torrent.magnet || `https://yts.mx/torrent/download/${torrent.hash}`,
+                                    seeds: torrent.seeds?.toString() || 'N/A',
+                                    size: torrent.size || 'N/A',
+                                    source: 'YTS'
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                return results.slice(0, 3);
+            } catch (error) {
+                console.log('YTS error:', error.message);
+                return [];
+            }
         }
+    ];
+    
+    // Try all methods
+    for (const method of searchMethods) {
+        try {
+            const results = await method();
+            if (results && results.length > 0) {
+                allResults.push(...results);
+                if (allResults.length >= 5) break;
+            }
+        } catch (error) {
+            console.error('Search method error:', error.message);
+        }
+        
+        // Small delay between requests
+        await new Promise(resolve => setTimeout(resolve, 500));
     }
     
+    console.log(`✅ Found ${allResults.length} torrents`);
     return allResults;
 }
 
@@ -355,8 +350,8 @@ async function searchTorrents(query) {
 async function handleTorrentSearch(chatId, data) {
     const [, id, type] = data.split('_');
     
-    // Get movie/TV show title from TMDb
     try {
+        // Get movie/TV show details
         const searchType = type === 'movie' ? 'movie' : 'tv';
         const response = await axios.get(
             `https://api.themoviedb.org/3/${searchType}/${id}`,
@@ -378,7 +373,7 @@ async function handleTorrentSearch(chatId, data) {
         // Send searching message
         const searchingMsg = await bot.sendMessage(
             chatId, 
-            `🔍 *Searching for torrents:* ${searchQuery}\n\n⏳ Please wait...`,
+            `🔍 *Searching for torrents:* ${searchQuery}\n\n⏳ Please wait...\n📡 Checking multiple sources...`,
             { parse_mode: 'Markdown' }
         );
         
@@ -386,12 +381,16 @@ async function handleTorrentSearch(chatId, data) {
         const torrents = await searchTorrents(searchQuery);
         
         // Delete searching message
-        await bot.deleteMessage(chatId, searchingMsg.message_id);
+        try {
+            await bot.deleteMessage(chatId, searchingMsg.message_id);
+        } catch (error) {
+            console.log('Could not delete message:', error.message);
+        }
         
         if (torrents.length === 0) {
             await bot.sendMessage(
                 chatId, 
-                '❌ No torrents found for this title. Try searching with different keywords.',
+                `❌ No torrents found for "${searchQuery}".\n\nTry:\n• Searching with different keywords\n• Using the search option again\n• Check back later for new uploads`,
                 {
                     reply_markup: {
                         inline_keyboard: [
@@ -415,31 +414,38 @@ async function handleTorrentSearch(chatId, data) {
             torrentText += `📡 Source: ${t.source || 'Unknown'}\n\n`;
         }
         
-        const buttons = {
+        // Create keyboard with magnet links
+        const keyboard = [];
+        for (let i = 0; i < limitedTorrents.length; i++) {
+            const t = limitedTorrents[i];
+            if (t.magnet && t.magnet.startsWith('magnet:')) {
+                keyboard.push([
+                    { text: `⬇️ Download ${i + 1} (${t.source})`, url: t.magnet }
+                ]);
+            }
+        }
+        
+        keyboard.push([
+            { text: '🔍 Search Again', callback_data: 'search_movie' },
+            { text: '🏠 Main Menu', callback_data: 'main_menu' }
+        ]);
+        
+        await bot.sendMessage(chatId, torrentText, {
             reply_markup: {
-                inline_keyboard: [
-                    ...limitedTorrents.map((t, index) => [
-                        { text: `⬇️ Magnet ${index + 1}`, url: t.magnet || '#' }
-                    ]),
-                    [
-                        { text: '🔍 Search Again', callback_data: 'search_movie' },
-                        { text: '🏠 Main Menu', callback_data: 'main_menu' }
-                    ]
-                ]
+                inline_keyboard: keyboard
             },
             parse_mode: 'Markdown'
-        };
-        
-        await bot.sendMessage(chatId, torrentText, buttons);
+        });
         
     } catch (error) {
         console.error('Torrent search error:', error.message);
         await bot.sendMessage(
             chatId, 
-            '❌ Error searching for torrents. Please try again.',
+            '❌ Error searching for torrents. Please try again.\n\nIf the problem persists, try using the search function again.',
             {
                 reply_markup: {
                     inline_keyboard: [
+                        [{ text: '🔍 Try Search', callback_data: 'search_movie' }],
                         [{ text: '🏠 Main Menu', callback_data: 'main_menu' }]
                     ]
                 }
@@ -476,7 +482,7 @@ async function handleTrending(chatId, messageId) {
         });
         
         buttons.reply_markup.inline_keyboard.push([
-            { text: '🔍 Search a Movie', callback_data: 'search_movie' },
+            { text: '🔍 Search', callback_data: 'search_movie' },
             { text: '🏠 Main Menu', callback_data: 'main_menu' }
         ]);
         
@@ -518,7 +524,7 @@ async function handlePopular(chatId, messageId) {
         });
         
         buttons.reply_markup.inline_keyboard.push([
-            { text: '🔍 Search a Movie', callback_data: 'search_movie' },
+            { text: '🔍 Search', callback_data: 'search_movie' },
             { text: '🏠 Main Menu', callback_data: 'main_menu' }
         ]);
         
@@ -551,13 +557,13 @@ async function showHelp(chatId, messageId) {
 *How to use:*
 1. Use the buttons to navigate
 2. Type the movie/TV show name when asked
-3. Click on magnet links to download torrents
+3. Click download buttons to get torrents
 
 *Commands:*
 /start - Show main menu
 /help - Show this help message
 
-*Note:* You need a torrent client (like qBittorrent) to download movies.`;
+*Note:* You need a torrent client to download movies.`;
 
     await bot.editMessageText(helpText, {
         chat_id: chatId,
@@ -602,7 +608,7 @@ app.listen(port, '0.0.0.0', () => {
 
 // ============ STARTUP MESSAGE ============
 console.log('🤖 CineverseAI Bot started successfully!');
-console.log(`📌 Bot token: ${token ? '✅ Set (length: ' + token.length + ')' : '❌ Missing'}`);
+console.log(`📌 Bot token: ${token ? '✅ Set' : '❌ Missing'}`);
 console.log(`📌 TMDb API Key: ${tmdbApiKey ? '✅ Set' : '❌ Missing'}`);
 console.log(`📌 Torrent Sources: 1337x, ThePirateBay, YTS`);
 
