@@ -1,327 +1,372 @@
-const TelegramBot = require('node-telegram-bot-api');
+require('dotenv').config();
+const { Telegraf } = require('telegraf');
 const axios = require('axios');
-const express = require('express');
+const http = require('http');
+const fs = require('fs');
+const { spawn } = require('child_process');
 
-// ============ CONFIG ============
-const token = process.env.TELEGRAM_BOT_TOKEN;
-const tmdbKey = process.env.TMDB_API_KEY;
-
-if (!token || !tmdbKey) {
-    console.error('❌ Missing TELEGRAM_BOT_TOKEN or TMDB_API_KEY');
-    process.exit(1);
-}
-
-const bot = new TelegramBot(token, { polling: true });
-const waiting = {};
-
-console.log('✅ Bot started');
-
-// ============ MAIN MENU ============
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, '🎥 *Welcome to CineverseAI Bot!*', {
-        parse_mode: 'Markdown',
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '🎬 Search Movie', callback_data: 'movie' }],
-                [{ text: '📺 Search TV Show', callback_data: 'tv' }],
-                [{ text: '🔥 Trending', callback_data: 'trending' }],
-                [{ text: '⭐ Popular', callback_data: 'popular' }]
-            ]
-        }
-    });
+// ==================== HTTP SERVER FOR RENDER ====================
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+});
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Health check server listening on port ${PORT}`);
 });
 
-// ============ CALLBACKS ============
-bot.on('callback_query', async (query) => {
-    const { data, message, id } = query;
-    const chatId = message.chat.id;
-    
-    await bot.answerCallbackQuery(id);
+// ==================== CONFIG ====================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2GB
 
-    if (data === 'movie' || data === 'tv') {
-        waiting[chatId] = data;
-        bot.editMessageText(`📝 *Enter ${data === 'movie' ? 'movie' : 'TV show'} name:*`, {
-            chat_id: chatId,
-            message_id: message.message_id,
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: [[{ text: '◀️ Back', callback_data: 'back' }]]
-            }
-        });
-        return;
+// ==================== GEMINI API ====================
+class GeminiAPI {
+  constructor() {
+    this.apiKey = GEMINI_API_KEY;
+    this.baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent';
+  }
+
+  async searchMovie(query) {
+    if (!this.apiKey) {
+      throw new Error('GEMINI_API_KEY not set');
     }
-
-    if (data === 'back') {
-        bot.editMessageText('🎥 *Welcome to CineverseAI Bot!*', {
-            chat_id: chatId,
-            message_id: message.message_id,
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '🎬 Search Movie', callback_data: 'movie' }],
-                    [{ text: '📺 Search TV Show', callback_data: 'tv' }],
-                    [{ text: '🔥 Trending', callback_data: 'trending' }],
-                    [{ text: '⭐ Popular', callback_data: 'popular' }]
-                ]
-            }
-        });
-        return;
-    }
-
-    if (data === 'trending') {
-        await getTrending(chatId, message.message_id);
-        return;
-    }
-
-    if (data === 'popular') {
-        await getPopular(chatId, message.message_id);
-        return;
-    }
-
-    if (data.startsWith('torrent_')) {
-        await getTorrents(chatId, data);
-        return;
-    }
-});
-
-// ============ SEARCH ============
-bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    
-    if (!text || text.startsWith('/') || !waiting[chatId]) return;
-    
-    const type = waiting[chatId];
-    delete waiting[chatId];
-    
-    await searchMedia(chatId, text, type);
-});
-
-async function searchMedia(chatId, query, type) {
-    try {
-        const endpoint = type === 'movie' ? 'movie' : 'tv';
-        const { data } = await axios.get(
-            `https://api.themoviedb.org/3/search/${endpoint}`,
-            { params: { api_key: tmdbKey, query } }
-        );
-
-        if (!data.results?.length) {
-            return bot.sendMessage(chatId, '❌ No results found.');
-        }
-
-        for (const item of data.results.slice(0, 5)) {
-            const title = type === 'movie' ? item.title : item.name;
-            const year = (type === 'movie' ? item.release_date : item.first_air_date)?.split('-')[0] || 'N/A';
-            const desc = item.overview?.slice(0, 150) || 'No description.';
-            const rating = item.vote_average?.toFixed(1) || 'N/A';
-
-            const buttons = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '⬇️ Get Torrents', callback_data: `torrent_${item.id}_${type}` }],
-                        [{ text: '🔍 Search Again', callback_data: type === 'movie' ? 'movie' : 'tv' }]
-                    ]
-                },
-                parse_mode: 'Markdown'
-            };
-
-            const caption = `🎥 *${title}* (${year})\n⭐ ${rating}/10\n\n📝 ${desc}`;
-
-            if (item.poster_path) {
-                await bot.sendPhoto(chatId, `https://image.tmdb.org/t/p/w500${item.poster_path}`, {
-                    caption: caption,
-                    ...buttons
-                });
-            } else {
-                await bot.sendMessage(chatId, caption, buttons);
-            }
-        }
-    } catch (error) {
-        bot.sendMessage(chatId, '❌ Search failed. Try again.');
-    }
-}
-
-// ============ TRENDING & POPULAR ============
-async function getTrending(chatId, msgId) {
-    try {
-        const { data } = await axios.get(
-            'https://api.themoviedb.org/3/trending/movie/week',
-            { params: { api_key: tmdbKey } }
-        );
-
-        let text = '🔥 *Trending Movies*\n\n';
-        const keyboard = [];
-
-        data.results.slice(0, 5).forEach((movie, i) => {
-            const year = movie.release_date?.split('-')[0] || 'N/A';
-            text += `${i+1}. *${movie.title}* (${year}) ⭐${movie.vote_average?.toFixed(1)}\n`;
-            keyboard.push([{ text: `⬇️ ${movie.title}`, callback_data: `torrent_${movie.id}_movie` }]);
-        });
-
-        keyboard.push([{ text: '🏠 Menu', callback_data: 'back' }]);
-
-        bot.editMessageText(text, {
-            chat_id: chatId,
-            message_id: msgId,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: keyboard }
-        });
-    } catch (error) {
-        bot.sendMessage(chatId, '❌ Failed to load trending.');
-    }
-}
-
-async function getPopular(chatId, msgId) {
-    try {
-        const { data } = await axios.get(
-            'https://api.themoviedb.org/3/movie/popular',
-            { params: { api_key: tmdbKey } }
-        );
-
-        let text = '⭐ *Popular Movies*\n\n';
-        const keyboard = [];
-
-        data.results.slice(0, 5).forEach((movie, i) => {
-            const year = movie.release_date?.split('-')[0] || 'N/A';
-            text += `${i+1}. *${movie.title}* (${year}) ⭐${movie.vote_average?.toFixed(1)}\n`;
-            keyboard.push([{ text: `⬇️ ${movie.title}`, callback_data: `torrent_${movie.id}_movie` }]);
-        });
-
-        keyboard.push([{ text: '🏠 Menu', callback_data: 'back' }]);
-
-        bot.editMessageText(text, {
-            chat_id: chatId,
-            message_id: msgId,
-            parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: keyboard }
-        });
-    } catch (error) {
-        bot.sendMessage(chatId, '❌ Failed to load popular.');
-    }
-}
-
-// ============ SOLIDTORRENTS SEARCH ============
-async function searchSolidTorrents(query) {
-    const results = [];
-    const clean = encodeURIComponent(query.trim());
-    
-    console.log(`🔍 Searching SolidTorrents: "${query}"`);
 
     try {
-        const { data } = await axios.get(
-            `https://solidtorrents.to/api/v1/search?q=${clean}&limit=10`,
-            { 
-                timeout: 15000,
-                headers: { 
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            }
-        );
+      const prompt = `
+        Search for the movie/TV series: "${query}".
         
-        if (data.results && data.results.length > 0) {
-            data.results.forEach(t => {
-                if (t.magnet) {
-                    results.push({
-                        name: t.name || 'Unknown',
-                        magnet: t.magnet,
-                        seeds: t.seeds || 'N/A',
-                        size: t.size || 'N/A',
-                        source: '🔷 SolidTorrents'
-                    });
-                }
-            });
-            console.log(`✅ Found ${results.length} torrents`);
+        IMPORTANT: You MUST return ONLY valid JSON. No other text.
+        
+        Return this exact JSON structure:
+        {
+          "title": "Full title with year",
+          "year": "Release year",
+          "synopsis": "2-3 sentence summary",
+          "rating": "IMDB rating if available",
+          "poster": "Poster image URL if available",
+          "downloadUrl": "Direct download URL for the video file (MP4) - ONLY if you can find a direct link",
+          "alternativeTitles": ["Alternative title 1", "Alternative title 2"]
         }
+        
+        If you cannot find a direct download URL, set downloadUrl to null.
+        If the movie doesn't exist, return {"error": "Movie not found"}.
+      `;
+
+      const response = await axios.post(
+        `${this.baseUrl}?key=${this.apiKey}`,
+        {
+          contents: [{ parts: [{ text: prompt }] }]
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 30000
+        }
+      );
+
+      const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        if (!result.error) {
+          return result;
+        }
+      }
     } catch (error) {
-        console.log('❌ SolidTorrents error:', error.message);
+      console.error('Gemini error:', error.message);
     }
+    return null;
+  }
 
-    return results.slice(0, 5);
-}
-
-// ============ TORRENT HANDLER ============
-async function getTorrents(chatId, data) {
-    const [, id, type] = data.split('_');
-    
+  async getDirectLink(query) {
     try {
-        const endpoint = type === 'movie' ? 'movie' : 'tv';
-        const { data: media } = await axios.get(
-            `https://api.themoviedb.org/3/${endpoint}/${id}`,
-            { params: { api_key: tmdbKey } }
-        );
+      const prompt = `
+        Find a direct download link for "${query}".
+        
+        Search for sites like:
+        - Archive.org
+        - Public domain movie sites
+        - Official streaming platforms with download option
+        
+        Return ONLY the direct URL as plain text.
+        If no direct link exists, return "NONE".
+      `;
 
-        const title = type === 'movie' ? media.title : media.name;
-        const year = (type === 'movie' ? media.release_date : media.first_air_date)?.split('-')[0] || '';
-        const poster = media.poster_path ? `https://image.tmdb.org/t/p/w500${media.poster_path}` : null;
-        const query = `${title} ${year}`.trim();
-
-        const loading = await bot.sendMessage(chatId, `🔍 Searching SolidTorrents for *${title}*...`, { 
-            parse_mode: 'Markdown' 
-        });
-
-        const torrents = await searchSolidTorrents(query);
-
-        await bot.deleteMessage(chatId, loading.message_id).catch(() => {});
-
-        if (!torrents.length) {
-            return bot.sendMessage(chatId, `❌ No torrents found for *${title}*.`, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '🔍 Try Again', callback_data: type === 'movie' ? 'movie' : 'tv' }],
-                        [{ text: '🏠 Menu', callback_data: 'back' }]
-                    ]
-                }
-            });
+      const response = await axios.post(
+        `${this.baseUrl}?key=${this.apiKey}`,
+        {
+          contents: [{ parts: [{ text: prompt }] }]
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 20000
         }
+      );
 
-        let text = `🎬 *${title}* (${year || 'N/A'})\n\n`;
-        const keyboard = [];
-
-        torrents.forEach((t, i) => {
-            text += `*${i+1}. ${t.name}*\n`;
-            text += `📦 ${t.size} | 👤 ${t.seeds} seeds\n`;
-            text += `📡 ${t.source}\n\n`;
-            if (t.magnet) {
-                keyboard.push([{ text: `⬇️ Download ${i+1}`, url: t.magnet }]);
-            }
-        });
-
-        keyboard.push([{ text: '🔍 Search Again', callback_data: type === 'movie' ? 'movie' : 'tv' }]);
-        keyboard.push([{ text: '🏠 Menu', callback_data: 'back' }]);
-
-        // Send with poster if available
-        if (poster) {
-            await bot.sendPhoto(chatId, poster, {
-                caption: text,
-                parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: keyboard }
-            });
-        } else {
-            await bot.sendMessage(chatId, text, {
-                parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: keyboard }
-            });
-        }
-
+      const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (text && text !== 'NONE' && text.startsWith('http')) {
+        return text.trim();
+      }
     } catch (error) {
-        console.error('Error:', error.message);
-        bot.sendMessage(chatId, '❌ Error. Try again.', {
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '🏠 Menu', callback_data: 'back' }]
-                ]
-            }
-        });
+      console.error('Direct link error:', error.message);
     }
+    return null;
+  }
 }
 
-// ============ SERVER ============
-const app = express();
-app.get('/', (req, res) => res.send('Bot is running'));
-app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-app.listen(process.env.PORT || 10000, () => console.log('✅ Server running'));
+// ==================== DIRECT DOWNLOADER ====================
+class Downloader {
+  async downloadFile(url, filename) {
+    try {
+      const response = await axios({
+        method: 'get',
+        url: url,
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.google.com/'
+        },
+        timeout: 300000, // 5 minutes
+        maxContentLength: MAX_FILE_SIZE,
+        maxBodyLength: MAX_FILE_SIZE
+      });
 
-console.log('🤖 Bot Ready!');
-console.log('📌 Torrent Source: SolidTorrents');
-console.log('📌 Posters: TMDB');
+      const writer = fs.createWriteStream(filename);
+      response.data.pipe(writer);
+
+      return new Promise((resolve, reject) => {
+        writer.on('finish', () => {
+          const stats = fs.statSync(filename);
+          if (stats.size > MAX_FILE_SIZE) {
+            fs.unlinkSync(filename);
+            reject(new Error('File exceeds 2GB limit'));
+          } else {
+            resolve(filename);
+          }
+        });
+        writer.on('error', reject);
+      });
+    } catch (error) {
+      console.error('Download error:', error.message);
+      throw error;
+    }
+  }
+
+  async downloadWithYtDlp(url, filename) {
+    return new Promise((resolve, reject) => {
+      const ytdlp = spawn('yt-dlp', [
+        '-o', filename,
+        '-f', 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]',
+        '--no-playlist',
+        '--limit-rate', '5M',
+        '--no-progress',
+        url
+      ]);
+      
+      ytdlp.on('close', (code) => {
+        if (code === 0) {
+          resolve(filename);
+        } else {
+          reject(new Error(`yt-dlp failed with code ${code}`));
+        }
+      });
+      
+      ytdlp.on('error', reject);
+    });
+  }
+}
+
+// ==================== BOT ====================
+const bot = new Telegraf(BOT_TOKEN);
+const gemini = new GeminiAPI();
+const downloader = new Downloader();
+
+// ---------- START ----------
+bot.start(async (ctx) => {
+  await ctx.replyWithMarkdown(
+    `🎬 *CineverseAI - Direct Download*\n\n` +
+    `Send me a movie or series name!\n\n` +
+    `✅ *Features:*\n` +
+    `• AI-powered search (Gemini)\n` +
+    `• Direct download in Telegram\n` +
+    `• Watch instantly\n` +
+    `• No external apps needed\n\n` +
+    `📦 *Max size:* 2GB\n` +
+    `⏱️ *Download time:* 3-10 minutes\n\n` +
+    `🔍 *Try:*\n` +
+    `• Inception\n` +
+    `• Eşref Rüya\n` +
+    `• Squid Game\n` +
+    `• Any movie from any country`
+  );
+});
+
+// ---------- HELP ----------
+bot.command('help', async (ctx) => {
+  await ctx.replyWithMarkdown(
+    `📖 *How to use:*\n\n` +
+    `1️⃣ Send movie/series name\n` +
+    `2️⃣ AI searches for download links\n` +
+    `3️⃣ Bot downloads the video\n` +
+    `4️⃣ You receive the file in Telegram\n\n` +
+    `⚡ *Tips:*\n` +
+    `• Use exact titles\n` +
+    `• Add year for better results\n` +
+    `• Keep chat open during download\n` +
+    `• Use VPN for privacy`
+  );
+});
+
+// ---------- SEARCH ----------
+bot.on('text', async (ctx) => {
+  if (ctx.message.text.startsWith('/')) return;
+  await handleSearch(ctx, ctx.message.text);
+});
+
+// ---------- SEARCH LOGIC ----------
+async function handleSearch(ctx, query) {
+  const statusMsg = await ctx.reply(`🔍 Searching for *${query}*...`, { parse_mode: 'Markdown' });
+  
+  try {
+    // Step 1: Search with Gemini
+    const movieInfo = await gemini.searchMovie(query);
+    
+    if (!movieInfo) {
+      await ctx.reply(
+        `❌ No results found for *${query}*.\n\n` +
+        `💡 *Try:*\n` +
+        `• Using the English title\n` +
+        `• Adding the year (e.g., "Inception 2010")\n` +
+        `• A different spelling\n` +
+        `• For Turkish: "Kurtlar Vadisi"\n` +
+        `• For K-Dramas: "Squid Game"`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Step 2: Show movie info
+    let message = `🎬 *${movieInfo.title}*`;
+    if (movieInfo.year) message += ` (${movieInfo.year})`;
+    if (movieInfo.rating) message += `\n⭐ Rating: ${movieInfo.rating}`;
+    if (movieInfo.synopsis) message += `\n\n📝 ${movieInfo.synopsis}`;
+    
+    if (movieInfo.poster) {
+      try {
+        await ctx.replyWithPhoto(movieInfo.poster, { 
+          caption: message, 
+          parse_mode: 'Markdown' 
+        });
+      } catch (e) {
+        await ctx.replyWithMarkdown(message);
+      }
+    } else {
+      await ctx.replyWithMarkdown(message);
+    }
+
+    // Step 3: Find download URL
+    let downloadUrl = movieInfo.downloadUrl;
+    
+    if (!downloadUrl) {
+      await ctx.reply(`🔍 Looking for download link...`);
+      downloadUrl = await gemini.getDirectLink(query);
+    }
+
+    if (!downloadUrl) {
+      await ctx.reply(
+        `⚠️ No direct download link found for *${movieInfo.title}*.\n\n` +
+        `💡 *Why this happens:*\n` +
+        `• Movie may be too large (>2GB)\n` +
+        `• Not available for direct download\n` +
+        `• Copyright restrictions\n\n` +
+        `🔍 *Try:*\n` +
+        `• A different movie\n` +
+        `• A smaller file (720p instead of 1080p)`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Step 4: Download the file
+    await ctx.reply(
+      `📥 *Downloading ${movieInfo.title}...*\n` +
+      `⏳ This takes 3-10 minutes\n` +
+      `💡 Keep this chat open!\n` +
+      `📦 Max size: 2GB`,
+      { parse_mode: 'Markdown' }
+    );
+
+    const filename = `/tmp/${movieInfo.title.replace(/[^a-zA-Z0-9]/g, '_')}.mp4`;
+    let downloadedFile = null;
+
+    try {
+      downloadedFile = await downloader.downloadFile(downloadUrl, filename);
+    } catch (error) {
+      // Try yt-dlp as fallback
+      try {
+        await ctx.reply(`🔄 Trying alternative download method...`);
+        downloadedFile = await downloader.downloadWithYtDlp(downloadUrl, filename);
+      } catch (ytError) {
+        console.error('yt-dlp error:', ytError.message);
+      }
+    }
+
+    // Step 5: Send the file
+    if (downloadedFile && fs.existsSync(downloadedFile)) {
+      const stats = fs.statSync(downloadedFile);
+      const fileSizeMB = (stats.size / 1024 / 1024).toFixed(1);
+      
+      await ctx.replyWithVideo(
+        { source: downloadedFile },
+        { 
+          caption: `🎬 *${movieInfo.title}*\n📦 Size: ${fileSizeMB}MB\n✅ Download complete!`,
+          parse_mode: 'Markdown',
+          supports_streaming: true
+        }
+      );
+      
+      // Cleanup
+      fs.unlinkSync(downloadedFile);
+      await ctx.reply('✅ Movie sent! Enjoy watching 🎥');
+      
+    } else {
+      await ctx.reply(
+        `❌ Download failed.\n\n` +
+        `💡 *Try:*\n` +
+        `• A different movie\n` +
+        `• A smaller version\n` +
+        `• Check if the movie exists`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    
+  } catch (error) {
+    console.error('Search error:', error.message);
+    await ctx.reply(
+      `❌ Error: ${error.message}\n\n` +
+      `Try a different movie or search term.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+}
+
+// ---------- ERROR HANDLING ----------
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  ctx.reply('⚠️ An error occurred. Please try again.');
+});
+
+// ==================== START ====================
+async function startBot() {
+  try {
+    await bot.launch();
+    console.log('✅ Bot is running!');
+    console.log(`📡 Bot username: @${bot.botInfo.username}`);
+  } catch (error) {
+    console.error('❌ Failed to start bot:', error);
+    process.exit(1);
+  }
+}
+
+startBot();
