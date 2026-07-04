@@ -3,20 +3,18 @@ const { Telegraf, Markup } = require('telegraf');
 const { message } = require('telegraf/filters');
 const axios = require('axios');
 const http = require('http');
-const { MovieScraper } = require('./scraper');
-const { connectDB, addMovie, searchMovie } = require('./database');
+const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const streamPipeline = promisify(pipeline);
 
 // ==================== DUMMY HTTP SERVER FOR RENDER ====================
 const server = http.createServer((req, res) => {
-  if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
-  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
 });
-
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Health check server listening on port ${PORT}`);
@@ -24,23 +22,187 @@ server.listen(PORT, '0.0.0.0', () => {
 
 // ==================== CONFIG ====================
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_IDS = process.env.ADMIN_IDS?.split(',').map(id => parseInt(id.trim())) || [];
-const STORAGE_CHANNEL_ID = parseInt(process.env.STORAGE_CHANNEL_ID);
-const TMDB_API_KEY = process.env.TMDB_API_KEY;
+const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2GB (Telegram limit)
 
-// ==================== TMDB ====================
-async function searchTMDB(query) {
-  if (!TMDB_API_KEY) {
-    console.warn('⚠️ TMDB_API_KEY not set. Skipping TMDb search.');
-    return [];
+// ==================== SCRAPER ====================
+class MovieScraper {
+  constructor() {
+    this.client = axios.create({
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      timeout: 30000
+    });
   }
-  try {
-    const url = `https://api.themoviedb.org/3/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(query)}`;
-    const response = await axios.get(url);
-    return response.data.results || [];
-  } catch (error) {
-    console.error('TMDB error:', error.message);
-    return [];
+
+  // Search for movie on multiple sites
+  async searchMovie(query) {
+    // Try various sources for direct download links
+    const sources = [
+      this.searchMovieWeb(query),
+      this.searchDlMovie(query),
+      this.searchMkvCinema(query)
+    ];
+    
+    for (const source of sources) {
+      const result = await source;
+      if (result) return result;
+    }
+    return null;
+  }
+
+  // Source 1: movie-web.app
+  async searchMovieWeb(query) {
+    try {
+      const searchUrl = `https://movie-web.app/search?q=${encodeURIComponent(query)}`;
+      const response = await this.client.get(searchUrl, { responseType: 'text' });
+      const $ = cheerio.load(response.data);
+      
+      // Find the first movie result and get its embed URL
+      const movieLink = $('.movie-card a').first();
+      if (movieLink.length) {
+        const movieId = movieLink.attr('href');
+        if (movieId) {
+          return {
+            title: movieLink.find('.title').text().trim() || query,
+            embedUrl: `https://movie-web.app${movieId}`,
+            source: 'movie-web'
+          };
+        }
+      }
+    } catch (error) {
+      console.error('Movie-web error:', error.message);
+    }
+    return null;
+  }
+
+  // Source 2: dlmovie.com
+  async searchDlMovie(query) {
+    try {
+      const searchUrl = `https://dlmovie.com/search/${encodeURIComponent(query)}`;
+      const response = await this.client.get(searchUrl, { responseType: 'text' });
+      const $ = cheerio.load(response.data);
+      
+      const result = $('.movie-item').first();
+      if (result.length) {
+        const link = result.find('a').first();
+        if (link.length) {
+          const href = link.attr('href');
+          return {
+            title: result.find('.title').text().trim() || query,
+            embedUrl: href.startsWith('http') ? href : `https://dlmovie.com${href}`,
+            source: 'dlmovie'
+          };
+        }
+      }
+    } catch (error) {
+      console.error('Dlmovie error:', error.message);
+    }
+    return null;
+  }
+
+  // Source 3: mkvcinema.com
+  async searchMkvCinema(query) {
+    try {
+      const searchUrl = `https://mkvcinema.com/?s=${encodeURIComponent(query)}`;
+      const response = await this.client.get(searchUrl, { responseType: 'text' });
+      const $ = cheerio.load(response.data);
+      
+      const result = $('.post').first();
+      if (result.length) {
+        const link = result.find('a').first();
+        if (link.length) {
+          const href = link.attr('href');
+          return {
+            title: result.find('h2').text().trim() || query,
+            embedUrl: href,
+            source: 'mkvcinema'
+          };
+        }
+      }
+    } catch (error) {
+      console.error('Mkvcinema error:', error.message);
+    }
+    return null;
+  }
+
+  // Get actual video download URL from embed page
+  async getVideoUrl(embedUrl) {
+    try {
+      const response = await this.client.get(embedUrl, { responseType: 'text' });
+      const $ = cheerio.load(response.data);
+      
+      // Try to find video source
+      // Method 1: Check for video tag
+      const videoSrc = $('video source').attr('src');
+      if (videoSrc) return videoSrc;
+      
+      // Method 2: Check for iframe
+      const iframeSrc = $('iframe').first().attr('src');
+      if (iframeSrc) {
+        // Recurse into iframe
+        return await this.getVideoUrl(iframeSrc);
+      }
+      
+      // Method 3: Check for direct links in script or a tags
+      const downloadLink = $('a[download], a[href*=".mp4"], a[href*=".mkv"]').first().attr('href');
+      if (downloadLink) return downloadLink;
+      
+      // Method 4: Check data attributes
+      const dataSrc = $('[data-src*=".mp4"], [data-video]').attr('data-src');
+      if (dataSrc) return dataSrc;
+      
+      return null;
+    } catch (error) {
+      console.error('Get video URL error:', error.message);
+      return null;
+    }
+  }
+
+  // Download video file
+  async downloadVideo(videoUrl) {
+    try {
+      // Validate URL
+      if (!videoUrl) throw new Error('No video URL found');
+      
+      // Create a new axios instance for downloading
+      const downloadClient = axios.create({
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.google.com/'
+        },
+        responseType: 'stream',
+        timeout: 120000, // 2 minutes
+        maxContentLength: MAX_FILE_SIZE,
+        maxBodyLength: MAX_FILE_SIZE
+      });
+      
+      const response = await downloadClient.get(videoUrl);
+      
+      // Check file size
+      const contentLength = response.headers['content-length'];
+      if (contentLength && parseInt(contentLength) > MAX_FILE_SIZE) {
+        throw new Error(`File too large (${(parseInt(contentLength) / 1024 / 1024).toFixed(0)}MB > 2GB)`);
+      }
+      
+      // Collect chunks
+      const chunks = [];
+      let size = 0;
+      
+      for await (const chunk of response.data) {
+        chunks.push(chunk);
+        size += chunk.length;
+        if (size > MAX_FILE_SIZE) {
+          throw new Error('File exceeds 2GB limit');
+        }
+      }
+      
+      return Buffer.concat(chunks);
+    } catch (error) {
+      console.error('Download error:', error.message);
+      throw error;
+    }
   }
 }
 
@@ -51,49 +213,30 @@ const scraper = new MovieScraper();
 // ---------- START ----------
 bot.start(async (ctx) => {
   await ctx.replyWithMarkdown(
-    `🎬 *CineverseAI Bot*\n\n` +
-    `Send me a movie name to search.\n` +
-    `Use: /search Inception or just type the name.\n\n` +
-    `👑 *Admins:* Use /upload to add movies.`
+    `🎬 *CineverseAI Bot - Direct Download*\n\n` +
+    `Send me a movie name and I'll send it to you!\n\n` +
+    `Examples:\n` +
+    `\`Inception\`\n` +
+    `\`The Dark Knight\`\n` +
+    `\`Avengers 2012\`\n\n` +
+    `⚡ Files up to 2GB\n` +
+    `⏱️ Large files may take 3-5 minutes\n` +
+    `📱 Works on any device`
   );
 });
 
-// ---------- SEARCH COMMAND ----------
-bot.command('search', async (ctx) => {
-  const query = ctx.message.text.replace('/search', '').trim();
-  if (!query) {
-    return ctx.reply('Please provide a movie name. Example: `/search Inception`');
-  }
-  await handleSearch(ctx, query);
-});
-
-// ---------- UPLOAD COMMAND (ADMIN ONLY) ----------
-bot.command('upload', async (ctx) => {
-  if (!ADMIN_IDS.includes(ctx.from.id)) {
-    return ctx.reply('⛔ Admin only.');
-  }
-
-  const args = ctx.message.text.replace('/upload', '').trim().split('|');
-  if (args.length < 3) {
-    return ctx.reply(
-      'Usage: `/upload Movie Title | 2024 | file_id`\n' +
-      'Forward a movie file to @ChannelBot to get its file_id.'
-    );
-  }
-
-  const title = args[0].trim();
-  const year = parseInt(args[1].trim());
-  const fileId = args[2].trim();
-
-  // Get TMDb info
-  let tmdbId = null;
-  const results = await searchTMDB(title);
-  if (results.length > 0) {
-    tmdbId = results[0].id;
-  }
-
-  await addMovie(title, year, tmdbId, fileId, '720p', 0, ctx.from.id);
-  await ctx.reply(`✅ Added: *${title} (${year})*`, { parse_mode: 'Markdown' });
+// ---------- HELP ----------
+bot.command('help', async (ctx) => {
+  await ctx.replyWithMarkdown(
+    `📖 *How to use:*\n\n` +
+    `1. Send any movie name\n` +
+    `2. I'll search for direct download links\n` +
+    `3. I download the movie\n` +
+    `4. You receive the video file directly\n\n` +
+    `⚠️ *Keep the chat open during download*\n` +
+    `⚠️ *Large files take 3-5 minutes*\n` +
+    `⚠️ *Make sure you have enough storage*`
+  );
 });
 
 // ---------- AUTO-SEARCH ANY TEXT ----------
@@ -104,69 +247,71 @@ bot.on(message('text'), async (ctx) => {
 
 // ---------- CORE SEARCH LOGIC ----------
 async function handleSearch(ctx, query) {
-  // 1. Check cache
-  const cached = await searchMovie(query);
-  if (cached.length > 0) {
-    await sendCachedMovie(ctx, cached);
-    return;
-  }
-
-  // 2. Scrape online
-  await ctx.reply('🔍 Searching online sources... (this may take 20-30s)');
+  const statusMsg = await ctx.reply(`🔍 Searching for *${query}*...`, { parse_mode: 'Markdown' });
   
-  const result = await scraper.getDownloadLink(query);
-  if (!result) {
-    return ctx.reply('❌ No sources found. Try a different title.');
-  }
-
-  // 3. Send magnet link
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.url('🧲 Magnet Link', result.magnet)],
-    [Markup.button.callback('📥 Download Torrent', `torrent_${query}`)]
-  ]);
-
-  await ctx.replyWithMarkdown(
-    `🎬 *${result.title}*\n` +
-    `Quality: \`${result.quality}\`\n` +
-    `Source: YTS\n\n` +
-    `⚠️ *Use a VPN and antivirus software.*`,
-    keyboard
-  );
-
-  // 4. Admin hint
-  if (ADMIN_IDS.includes(ctx.from.id)) {
+  try {
+    // Step 1: Search for movie
+    const movieInfo = await scraper.searchMovie(query);
+    
+    if (!movieInfo) {
+      await ctx.reply(
+        `❌ No results found for *${query}*.\n\n` +
+        `Try:\n` +
+        `• Using the English title\n` +
+        `• Adding the year (e.g., "Inception 2010")\n` +
+        `• A different movie`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    // Step 2: Get video URL
+    await ctx.reply(`📡 Found: *${movieInfo.title}*\n🔗 Getting download link...`, { parse_mode: 'Markdown' });
+    
+    const videoUrl = await scraper.getVideoUrl(movieInfo.embedUrl);
+    if (!videoUrl) {
+      await ctx.reply(
+        `❌ Could not find a direct download link for *${movieInfo.title}*.\n\n` +
+        `The movie may be on a platform that doesn't allow direct downloads.`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    
+    // Step 3: Download video
     await ctx.reply(
-      '💡 *Admin:* To cache this movie, upload to storage channel and use:\n' +
-      `/upload ${result.title} | 2024 | file_id_here`,
+      `📥 Downloading *${movieInfo.title}*\n` +
+      `⏳ This may take 3-5 minutes...\n` +
+      `📦 Max size: 2GB`,
       { parse_mode: 'Markdown' }
+    );
+    
+    const videoBuffer = await scraper.downloadVideo(videoUrl);
+    
+    // Step 4: Send video
+    const fileName = `${movieInfo.title}.mp4`;
+    await ctx.replyWithVideo(
+      { source: videoBuffer, filename: fileName },
+      { 
+        caption: `🎬 *${movieInfo.title}*\n✅ Download complete!`,
+        parse_mode: 'Markdown',
+        supports_streaming: true
+      }
+    );
+    
+    await ctx.reply('✅ Movie sent successfully! Enjoy watching 🎥');
+    
+  } catch (error) {
+    console.error('Search/Download error:', error.message);
+    await ctx.reply(
+      `❌ Error: ${error.message}\n\n` +
+      `Try:\n` +
+      `• A different movie\n` +
+      `• A smaller file size\n` +
+      `• Using the English title`
     );
   }
 }
-
-// ---------- SEND CACHED MOVIE ----------
-async function sendCachedMovie(ctx, movies) {
-  for (const movie of movies.slice(0, 3)) {
-    try {
-      await ctx.telegram.copyMessage(
-        ctx.chat.id,
-        STORAGE_CHANNEL_ID,
-        parseInt(movie.file_id)
-      );
-      await ctx.replyWithMarkdown(
-        `✅ *${movie.title} (${movie.year})*\n` +
-        `Quality: \`${movie.quality}\``
-      );
-    } catch (error) {
-      console.error('Failed to send cached movie:', error.message);
-      await ctx.reply('❌ This file is no longer available on Telegram.');
-    }
-  }
-}
-
-// ---------- CALLBACK HANDLER ----------
-bot.action(/torrent_.+/, async (ctx) => {
-  await ctx.answerCbQuery('Magnet link sent above. Use a torrent client.');
-});
 
 // ---------- ERROR HANDLING ----------
 bot.catch((err, ctx) => {
@@ -177,7 +322,6 @@ bot.catch((err, ctx) => {
 // ==================== START ====================
 async function startBot() {
   try {
-    await connectDB();
     await bot.launch();
     console.log('✅ Bot is running!');
     console.log(`📡 Bot username: @${bot.botInfo.username}`);
